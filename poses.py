@@ -4,6 +4,9 @@
 帧状态机：UNPROCESSED → TRACKED / KEYFRAME / LOST / RELOCATED
 流程：顺序匹配 → 三角化/PnP → 局部 BA → 回环 → 全局 BA → PGO。
 依赖 OpenCV + SciPy + NumPy；输出 SfMResult。
+
+约定：SfMResult.poses 中，LOST / INVALID 帧为 None，
+      下游（稠密重建 / 导出 / GUI）据此跳过无效帧。
 """
 
 import logging
@@ -67,6 +70,7 @@ MULTIVIEW_MIN_OBS = 3
 MULTIVIEW_TRIGGER_INTERVAL = 60
 MULTIVIEW_RANSAC_ITERS = 50
 MULTIVIEW_RANSAC_THRESH = 3.0
+MULTIVIEW_MAX_POINTS_PER_CALL = 8000  # 单次重三角化的点数上限
 
 # 初始化
 BASELINE_MIN_POS_RATIO = 0.5
@@ -189,7 +193,7 @@ class CameraPose:
 
 @dataclass
 class Observation:
-    """单条观测。color 为 RGB uint8，供 3DGS 多视图颜色聚合。"""
+    """单条观测。color 为 RGB uint8，供多视图颜色聚合。"""
     frame_idx: int
     kp_idx: int
     u: float
@@ -242,7 +246,7 @@ class Frame:
 @dataclass
 class SfMResult:
     intrinsics: CameraIntrinsics
-    poses: List[CameraPose]
+    poses: List[Optional[CameraPose]]       # LOST / INVALID 帧为 None
     xyz: np.ndarray
     rgb: np.ndarray
     obs_per_point: List[List[Tuple[int, int, float, float]]]
@@ -492,7 +496,7 @@ class LoopDetector:
         self.vocab_size = vocab_size
         self.words: Optional[np.ndarray] = None
         self.hists: Dict[int, np.ndarray] = {}
-        self._trained = False
+        self.trained = False
         self._norm_type = cv2.NORM_HAMMING
 
     def train(self, keyframe_descs: List[np.ndarray], norm_type: int):
@@ -506,7 +510,7 @@ class LoopDetector:
         sel = rng.choice(len(all_desc), size=self.vocab_size, replace=False)
         self.words = all_desc[sel].copy()
         self._norm_type = norm_type
-        self._trained = True
+        self.trained = True
         logger.info(f"[loop] 词袋训练完成，词数={self.vocab_size}")
 
     def _hamming_argmin(self, d_uint8: np.ndarray,
@@ -542,7 +546,7 @@ class LoopDetector:
         return hist
 
     def add(self, idx: int, desc: np.ndarray):
-        if not self._trained:
+        if not self.trained:
             return
         self.hists[idx] = self._quantize(desc)
 
@@ -552,7 +556,7 @@ class LoopDetector:
               min_score: float = LOOP_MIN_SCORE,
               max_candidates: int = LOOP_MAX_CANDIDATES,
               ) -> List[Tuple[int, float]]:
-        if not self._trained:
+        if not self.trained:
             return []
         q = self._quantize(desc)
         if q.sum() <= 0:
@@ -715,6 +719,7 @@ def _retriangulate_multiview(map_points: List[MapPoint],
                              min_obs: int = MULTIVIEW_MIN_OBS,
                              ransac_iters: int = MULTIVIEW_RANSAC_ITERS,
                              ransac_thresh: float = MULTIVIEW_RANSAC_THRESH,
+                             max_points: int = MULTIVIEW_MAX_POINTS_PER_CALL,
                              ) -> int:
     """对观测数 ≥ min_obs 的点做 RANSAC + DLT 重三角化。"""
     if not map_points:
@@ -722,14 +727,26 @@ def _retriangulate_multiview(map_points: List[MapPoint],
     K64 = np.asarray(K, dtype=np.float64)
     updated = 0
 
-    for pt in map_points:
+    # 只处理观测数最多的前 max_points 个点，控制单次耗时
+    if len(map_points) > max_points:
+        order = sorted(range(len(map_points)),
+                       key=lambda i: map_points[i].obs_count,
+                       reverse=True)[:max_points]
+        candidates = [map_points[i] for i in order]
+    else:
+        candidates = map_points
+
+    # 复用同一 rng，避免每点都构造
+    rng = np.random.default_rng(0)
+
+    for pt in candidates:
         obs = pt.obs
         if len(obs) < min_obs:
             continue
 
         proj_mats = []
         uvs = []
-        pose_list = []
+        centers_list = []
         for o in obs:
             f = frames.get(o.frame_idx)
             if f is None or f.pose is None:
@@ -737,16 +754,16 @@ def _retriangulate_multiview(map_points: List[MapPoint],
             P = K64 @ np.asarray(f.pose.RT[:3], dtype=np.float64)
             proj_mats.append(P)
             uvs.append((o.u, o.v))
-            pose_list.append(f.pose)
+            centers_list.append(f.pose.center)
         if len(uvs) < min_obs:
             continue
 
         uvs = np.asarray(uvs, dtype=np.float64)
+        centers_arr = np.asarray(centers_list, dtype=np.float64)
 
         n = len(uvs)
         best_inliers = -1
         best_X = None
-        rng = np.random.default_rng(pt.idx)
         n_iters = min(ransac_iters, max(10, n * 3))
         for _ in range(n_iters):
             if n <= min_obs:
@@ -764,8 +781,7 @@ def _retriangulate_multiview(map_points: List[MapPoint],
                     continue
                 u, v = proj[0] / proj[2], proj[1] / proj[2]
                 err = np.hypot(u - uvs[k, 0], v - uvs[k, 1])
-                pt_cam = pose_list[k].R @ X + pose_list[k].t.flatten()
-                if err < ransac_thresh and pt_cam[2] > 1e-6:
+                if err < ransac_thresh:
                     inl += 1
             if inl > best_inliers:
                 best_inliers = inl
@@ -774,27 +790,26 @@ def _retriangulate_multiview(map_points: List[MapPoint],
         if best_X is None or best_inliers < max(min_obs, int(0.6 * n)):
             continue
 
-        # 视差角检查
-        centers = np.array([p.center for p in pose_list])
-        v1 = best_X - centers
+        # 视差角检查（向量化）
+        v1 = best_X - centers_arr
         norms = np.linalg.norm(v1, axis=1)
         if (norms < 1e-9).any():
             continue
         v1n = v1 / norms[:, None]
-        max_angle = 0.0
-        for a in range(len(v1n)):
-            for b in range(a + 1, len(v1n)):
-                c = float(np.clip(np.dot(v1n[a], v1n[b]), -1.0, 1.0))
-                max_angle = max(max_angle, np.degrees(np.arccos(c)))
+        cos_mat = v1n @ v1n.T
+        np.fill_diagonal(cos_mat, 1.0)
+        min_cos = float(cos_mat.min())
+        max_angle = float(np.degrees(np.arccos(np.clip(min_cos, -1.0, 1.0))))
         if max_angle < MIN_TRI_ANGLE_DEG:
             continue
 
         old = pt.xyz
-        if np.linalg.norm(best_X - old.astype(np.float64)) < 10.0 * max(1e-6, np.linalg.norm(old)):
+        old_norm = float(np.linalg.norm(old))
+        if np.linalg.norm(best_X - old.astype(np.float64)) < 10.0 * max(1e-6, old_norm):
             pt.xyz = best_X.astype(np.float32)
             updated += 1
 
-    logger.info(f"[multiview] DLT 重三角化更新 {updated} / {len(map_points)} 个点")
+    logger.info(f"[multiview] DLT 重三角化更新 {updated} / {len(candidates)} 个点")
     return updated
 
 
@@ -1198,8 +1213,6 @@ def _compute_point_errors(map_points, poses_by_frame, focal, fy, cx, cy):
     invalid_pts = ~np.isfinite(xyz_all).all(axis=1)
     neg_ratio[invalid_pts] = 1.0
 
-    # 用列表推导式 + np.asarray 一次性构建扁平观测表，
-    # 比逐点 append 快得多（数千点 × 平均 3 obs）。
     flat = [
         (i, o.frame_idx, o.u, o.v)
         for i, pt in enumerate(map_points)
@@ -1310,7 +1323,7 @@ def prune_map_points(map_points: List[MapPoint], frames: Dict[int, Frame],
 
 
 def filter_point_cloud(map_points: List[MapPoint],
-                       poses_by_frame: Dict[int, CameraPose],
+                       poses_by_frame: Dict[int, Optional[CameraPose]],
                        focal, fy, cx, cy, reproj_thresh):
     """按中位误差倍数 + 阈值下限过滤点云，返回 (xyz, keep_mask)。"""
     if not map_points:
@@ -1419,6 +1432,7 @@ def estimate_poses(
                                     match_dist)
         track_quality = 0.0
         has_pose = False
+        mask_pose = None
 
         if len(matches) >= min_inliers:
             pts_prev = np.array([prev.kps[m.queryIdx].pt for m in matches],
@@ -1472,9 +1486,11 @@ def estimate_poses(
 
         # ---- 三角化新点 ----
         if has_pose:
+            inlier_mask_for_tri = (mask_pose.ravel().astype(bool)
+                                   if mask_pose is not None and len(matches)
+                                   else np.zeros(len(matches), dtype=bool))
             _triangulate_from_pair(
-                i, i - 1, matches,
-                mask_pose.ravel().astype(bool) if len(matches) else np.zeros(0, bool),
+                i, i - 1, matches, inlier_mask_for_tri,
                 frames, map_points,
                 focal0, fy0, cx, cy, triang_thresh)
             frame.track_quality = track_quality
@@ -1545,7 +1561,7 @@ def estimate_poses(
 
             # 回环检测
             if enable_loop and len(keyframes) >= 5:
-                if not loop_detector._trained and len(keyframes) >= 5:
+                if not loop_detector.trained:
                     descs = [frames[k].desc for k in keyframes]
                     loop_detector.train(descs, norm_type)
                     for k in keyframes:
@@ -1619,6 +1635,15 @@ def estimate_poses(
             max_iter=BA_GLOBAL_ITERS,
             is_global=True,
             focal_init=focal_init)
+        # 全局 BA 后内参已更新，重建 K_final
+        K_final = _build_K(focal0, fy0, cx, cy)
+
+    # 过滤已被 cull 的关键帧对应的边 / 回环
+    valid_kf_set = set(keyframes)
+    pose_edges = [(a, b, T) for a, b, T in pose_edges
+                  if a in valid_kf_set and b in valid_kf_set]
+    loop_closures = [(a, b) for a, b in loop_closures
+                     if a in valid_kf_set and b in valid_kf_set]
 
     if enable_pgo and len(pose_edges) >= 3:
         logger.info("=== 位姿图优化 ===")
@@ -1628,6 +1653,7 @@ def estimate_poses(
                                         iters=PGO_ITERS)
         for k, p in new_poses.items():
             frames[k].pose = p
+        # PGO 改变了位姿但内参不变，K_final 沿用
 
     # PGO 后位姿变化，再重三角化一次
     _retriangulate_multiview(map_points, frames, K_final,
@@ -1639,7 +1665,8 @@ def estimate_poses(
     # =====================================================================
     # 输出
     # =====================================================================
-    all_poses: List[CameraPose] = []
+    # 内部填充版：用于点云过滤等需要位姿的计算
+    filled_poses: List[CameraPose] = []
     last_valid = frames[0].pose
     for i in range(len(frame_paths)):
         p = frames[i].pose
@@ -1647,9 +1674,20 @@ def estimate_poses(
             p = last_valid
         else:
             last_valid = p
-        all_poses.append(p)
+        filled_poses.append(p)
 
-    poses_by_frame = {i: all_poses[i] for i in range(len(all_poses))}
+    # 对外输出：LOST / INVALID 帧置 None，让下游正确跳过
+    all_poses: List[Optional[CameraPose]] = []
+    for i in range(len(frame_paths)):
+        st = frames[i].status
+        if st in (FrameStatus.LOST, FrameStatus.INVALID) or frames[i].pose is None:
+            all_poses.append(None)
+        else:
+            all_poses.append(frames[i].pose)
+
+    # 使用填充版位姿过滤点云（这些位姿在数值上仍是“上一有效帧”，
+    # 但过滤主要看重投影误差；若用 None 版会丢掉整段帧的观测）
+    poses_by_frame = {i: filled_poses[i] for i in range(len(filled_poses))}
     xyz, mask = filter_point_cloud(map_points, poses_by_frame,
                                    focal0, fy0, cx, cy, reproj_thresh)
 
@@ -2016,7 +2054,7 @@ def _try_global_relocalization(frame, keyframes, map_points, frames,
                                loop_detector, focal, fy, cx, cy,
                                reproj_thresh):
     """BoW 全局检索候选关键帧 → 2D-3D 匹配 → PnP 恢复位姿。"""
-    if not loop_detector._trained or len(keyframes) < 5:
+    if not loop_detector.trained or len(keyframes) < 5:
         return None
     if frame.desc is None or len(frame.desc) == 0:
         return None

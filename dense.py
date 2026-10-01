@@ -22,13 +22,14 @@
 纯 OpenCV + SciPy + NumPy，无外部 SfM/MVS 依赖。
 """
 
+import hashlib
 import json
 import logging
 import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -53,7 +54,7 @@ class DenseAbortedError(RuntimeError):
 # 配置与结果
 # ---------------------------------------------------------------------------
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2  # v2: 指纹加入内参/位姿哈希
 
 
 @dataclass
@@ -105,27 +106,7 @@ def dense_reconstruct(
     cache_dir: Optional[str] = None,
     stop_event=None,
 ) -> DenseResult:
-    """从 SfM 结果做稠密重建，输出带 RGB 的点云 PLY。
-
-    参数：
-        frame_paths: 帧图像路径列表，与 poses 一一对应。
-        intrinsics: 相机内参。
-        poses: 相机位姿列表，None 表示该帧位姿缺失。
-        output_path: 输出 PLY 路径。
-        keyframes: 关键帧索引列表（可选，优先用于选帧对）。
-        config: 稠密重建参数，None 用默认。
-        progress_callback: (已完成对数, 总对数, 描述) 回调，可选。
-        cache_dir: 帧对缓存目录；为 None 或 config.enable_cache=False 时不启用。
-        stop_event: 可选的中断信号（threading.Event 或兼容对象）。
-                    置位后：把内存里已算完的帧对批量落盘，抛 DenseAbortedError。
-
-    返回：
-        DenseResult，含统计信息。
-
-    异常：
-        DenseAbortedError：用户中断。已算帧对已写入缓存。
-        RuntimeError：无法产生任何点，或有效位姿不足。
-    """
+    """从 SfM 结果做稠密重建，输出带 RGB 的点云 PLY。"""
     t_start = time.time()
     cfg = config or DenseConfig()
 
@@ -157,8 +138,12 @@ def dense_reconstruct(
     )
 
     # ---- 缓存指纹 ----
+    # 加入内参 / 位姿哈希：SfM 结果变化时自动作废稠密缓存
+    intr_poses_hash = _intr_poses_hash(intrinsics, poses)
+
     if use_cache:
-        fingerprint = _cache_fingerprint(frame_paths, cfg, scene_scale)
+        fingerprint = _cache_fingerprint(frame_paths, cfg, scene_scale,
+                                         intr_poses_hash)
         if _load_and_check_meta(meta_path, fingerprint):
             n_existing = len(list(cache_path.glob("pair_*.npz")))
             logger.info("[dense] 缓存命中：参数指纹一致，已存在 %d 个帧对文件", n_existing)
@@ -183,8 +168,6 @@ def dense_reconstruct(
     failed = 0
     cached_hits = 0
 
-    # 内存中累积的待写缓存：[(pair_path, xyz, rgb)]
-    # xyz / rgb 为 None 表示该对失败（写空数组作标记）
     pending_writes: List[Tuple[Path, Optional[np.ndarray], Optional[np.ndarray]]] = []
 
     def _flush_pending() -> None:
@@ -271,8 +254,6 @@ def dense_reconstruct(
             if pair_file is not None:
                 pending_writes.append((pair_file, xyz, rgb))
     except BaseException:
-        # 任何异常（含 DenseAbortedError、KeyboardInterrupt）：
-        # 已算的帧对都要保住，flush 后再往上抛
         try:
             _flush_pending()
         except Exception as fe:
@@ -287,7 +268,6 @@ def dense_reconstruct(
         if cfg.cache_on_success:
             _flush_pending()
         else:
-            # 默认不写缓存，直接丢弃（省磁盘写入）
             if pending_writes:
                 logger.info(
                     "[dense] 正常完成，丢弃 %d 个待写帧对（cache_on_success=False）",
@@ -351,10 +331,36 @@ def _pair_filename(il: int, ir: int) -> str:
     return f"pair_{int(il):04d}_{int(ir):04d}.npz"
 
 
+def _intr_poses_hash(intrinsics: CameraIntrinsics,
+                     poses: List[Optional[CameraPose]]) -> str:
+    """内参 + 位姿内容哈希，用于缓存指纹。
+
+    位姿抽样到最多 30 个（保证任意长度序列的计算耗时恒定）。
+    """
+    h = hashlib.md5()
+    K = np.asarray(intrinsics.K, dtype=np.float32)
+    h.update(K.tobytes())
+
+    n = len(poses)
+    step = max(1, n // 30)
+    for i in range(0, n, step):
+        p = poses[i]
+        if p is None:
+            h.update(b"none")
+        else:
+            R = np.asarray(p.R, dtype=np.float32)
+            t = np.asarray(p.t, dtype=np.float32).reshape(3)
+            h.update(R.tobytes())
+            h.update(t.tobytes())
+    h.update(f"n={n}".encode())
+    return h.hexdigest()
+
+
 def _cache_fingerprint(
     frame_paths: List[str],
     cfg: DenseConfig,
     scene_scale: float,
+    intr_poses_hash: str,
 ) -> dict:
     """生成参数指纹；任意影响输出几何的项变化都会使缓存失效。"""
     nd = max(16, (int(cfg.num_disparities) // 16) * 16)
@@ -382,6 +388,7 @@ def _cache_fingerprint(
         "n_frames": len(frame_paths),
         "first_frame_mtime": first_mtime,
         "last_frame_mtime": last_mtime,
+        "intr_poses_hash": intr_poses_hash,
     }
 
 
@@ -412,13 +419,7 @@ def _clear_cache(cache_path: Path) -> None:
 
 
 def _load_pair_cache(path: Path) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], str]:
-    """读帧对缓存。
-
-    返回 (xyz, rgb, state)：
-        state = 'hit'   → 读到有效点云
-        state = 'empty' → 该对曾算过但失败（空数组）
-        state = 'miss'  → 文件不存在或损坏，应重算
-    """
+    """读帧对缓存。"""
     if not path.exists():
         return None, None, "miss"
     try:
@@ -427,6 +428,11 @@ def _load_pair_cache(path: Path) -> Tuple[Optional[np.ndarray], Optional[np.ndar
             rgb = np.asarray(data["rgb"])
     except Exception as e:
         logger.debug("[dense] 读取缓存失败 %s: %s", path, e)
+        # 顺手删除损坏的缓存文件，避免下次重复失败
+        try:
+            path.unlink()
+        except OSError:
+            pass
         return None, None, "miss"
 
     if xyz.shape[0] == 0:
@@ -441,10 +447,7 @@ def _save_pair_cache(
     xyz: Optional[np.ndarray],
     rgb: Optional[np.ndarray],
 ) -> None:
-    """写帧对缓存。失败时写空数组以标记「已尝试且失败」。
-
-    先写 .tmp 再原子替换，避免中断留下半截 npz。
-    """
+    """写帧对缓存。失败时写空数组以标记「已尝试且失败」。"""
     if xyz is None or rgb is None or len(xyz) == 0:
         xyz = np.zeros((0, 3), dtype=np.float32)
         rgb = np.zeros((0, 3), dtype=np.uint8)
@@ -488,10 +491,7 @@ def _process_pair(
     min_depth: float,
     max_depth: float,
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """处理一对图像：立体校正 → SGBM → 反投影到世界坐标。
-
-    返回 (xyz_world (N,3) float32, rgb (N,3) uint8) 或 None。
-    """
+    """处理一对图像：立体校正 → SGBM → 反投影到世界坐标。"""
     # ---- 读图 + 降采样 ----
     img_l = cv2.imread(path_l, cv2.IMREAD_COLOR)
     img_r = cv2.imread(path_r, cv2.IMREAD_COLOR)
@@ -506,8 +506,6 @@ def _process_pair(
         img_r = cv2.resize(img_r, new_size, interpolation=cv2.INTER_AREA)
 
     h, w = img_l.shape[:2]
-    gray_l = cv2.cvtColor(img_l, cv2.COLOR_BGR2GRAY)
-    gray_r = cv2.cvtColor(img_r, cv2.COLOR_BGR2GRAY)
 
     # ---- 缩放后的内参 ----
     K = np.asarray(intrinsics.K, dtype=np.float64).copy()
@@ -532,6 +530,8 @@ def _process_pair(
 
     rect_l = cv2.remap(img_l, map1x, map1y, cv2.INTER_LINEAR)
     rect_r = cv2.remap(img_r, map2x, map2y, cv2.INTER_LINEAR)
+
+    # 直接对校正图做灰度，不再多算一遍原始灰度
     gray_l_r = cv2.cvtColor(rect_l, cv2.COLOR_BGR2GRAY)
     gray_r_r = cv2.cvtColor(rect_r, cv2.COLOR_BGR2GRAY)
 
@@ -557,7 +557,7 @@ def _process_pair(
 
     # ---- 校正左系 → 原左系 → 世界系（只对有效像素做变换）----
     ys, xs = np.nonzero(valid)
-    pts_valid = pts3d_rect[ys, xs].astype(np.float64)  # (M, 3)
+    pts_valid = pts3d_rect[ys, xs].astype(np.float64)
 
     R_L = np.asarray(pose_l.R, dtype=np.float64)
     t_L = pose_l.t.reshape(3).astype(np.float64)
@@ -571,21 +571,20 @@ def _process_pair(
     return xyz, rgb
 
 
-def _compute_disparity(
-    gray_l: np.ndarray,
-    gray_r: np.ndarray,
-    num_disparities: int,
-    block_size: int,
-) -> Optional[np.ndarray]:
-    """SGBM 视差计算，返回 float32（像素单位）。"""
+# SGBM 实例缓存：相同 (num_disparities, block_size) 复用
+_SGBM_CACHE: Dict[Tuple[int, int], "cv2.StereoSGBM"] = {}
+
+
+def _get_sgbm(num_disparities: int, block_size: int) -> "cv2.StereoSGBM":
     nd = max(16, (int(num_disparities) // 16) * 16)
     bs = int(block_size)
     if bs % 2 == 0:
         bs += 1
     bs = max(3, min(bs, 21))
-
-    try:
-        stereo = cv2.StereoSGBM_create(
+    key = (nd, bs)
+    sgbm = _SGBM_CACHE.get(key)
+    if sgbm is None:
+        sgbm = cv2.StereoSGBM_create(
             minDisparity=0,
             numDisparities=nd,
             blockSize=bs,
@@ -598,6 +597,19 @@ def _compute_disparity(
             preFilterCap=31,
             mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
         )
+        _SGBM_CACHE[key] = sgbm
+    return sgbm
+
+
+def _compute_disparity(
+    gray_l: np.ndarray,
+    gray_r: np.ndarray,
+    num_disparities: int,
+    block_size: int,
+) -> Optional[np.ndarray]:
+    """SGBM 视差计算，返回 float32（像素单位）。"""
+    try:
+        stereo = _get_sgbm(num_disparities, block_size)
         disp16 = stereo.compute(gray_l, gray_r)
     except cv2.error as e:
         logger.warning("[dense] SGBM 失败: %s", e)
@@ -634,7 +646,6 @@ def _select_pairs(
         pairs = [(i, i + 1) for i in range(n_frames - 1)]
 
     if len(pairs) > max_pairs:
-        # 用 round 而非截断，避免间距 < 1 时取到重复索引
         idx = np.round(np.linspace(0, len(pairs) - 1, max_pairs)).astype(int)
         idx = np.unique(idx)
         pairs = [pairs[i] for i in idx]

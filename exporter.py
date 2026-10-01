@@ -95,8 +95,10 @@ def write_ply(path, xyz: np.ndarray, rgb: Optional[np.ndarray] = None) -> None:
     """写二进制 little-endian PLY。
 
     rgb=None 时只写 x y z；否则写 x y z + red green blue。
+    无论主机字节序如何，均以小端输出（与 header 一致）。
     """
-    xyz = np.asarray(xyz, dtype=np.float32)
+    # 强制小端，避免大端机器上 header 与实际字节序不一致
+    xyz = np.asarray(xyz, dtype="<f4")
     if xyz.ndim != 2 or xyz.shape[1] != 3:
         raise ValueError(f"xyz 形状应为 (N,3)，实际 {xyz.shape}")
     n = int(xyz.shape[0])
@@ -123,6 +125,7 @@ def write_ply(path, xyz: np.ndarray, rgb: Optional[np.ndarray] = None) -> None:
             arr["r"], arr["g"], arr["b"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
             f.write(arr.tobytes())
         else:
+            # xyz 已强制 <f4，直接写就行
             f.write(xyz.tobytes())
 
 
@@ -135,6 +138,7 @@ def write_cameras_txt(path, poses: Sequence[Optional[CameraPose]]) -> None:
     lines = [
         "# frame_index tx ty tz qx qy qz qw",
         "# 约定: X_cam = R @ X_world + t  (OpenCV 相机系)",
+        "# 位姿缺失的帧会被跳过",
     ]
     for i, p in enumerate(poses):
         if p is None:

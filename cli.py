@@ -167,8 +167,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     frame_paths_file = workdir / "frame_paths.txt"
     meta_path = workdir / "frame_meta.json"
+    sfm_meta_path = workdir / "sfm_meta.json"
 
-    can_reuse_frames = frame_paths_file.exists()
+    # CLI / GUI 统一：同时校验 frame_paths.txt 与 frames/ 目录
+    can_reuse_frames = frame_meta.can_reuse_frames(workdir)
 
     current_meta = {
         "video": os.path.abspath(args.video),
@@ -184,7 +186,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         mismatch_reasons = frame_meta.check_meta(meta_path, current_meta)
         if mismatch_reasons:
             logger.warning(
-                "  提取参数变化（%s），重新提取帧并作废下游缓存（位姿 / 点云）",
+                "  提取参数变化（%s），重新提取帧并作废下游缓存（位姿 / 点云 / 稠密帧对）",
                 "; ".join(mismatch_reasons),
             )
             can_reuse_frames = False
@@ -238,6 +240,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
     sparse_file = workdir / "sparse_points.npy"
 
     sfm_result = None
+    cached_keyframes = None
+    cached_loop_closures = []
+    cached_frame_status = None
 
     if intrinsics_file.exists() and poses_file.exists() and sparse_file.exists():
         K = np.load(intrinsics_file)
@@ -245,6 +250,17 @@ def run_pipeline(args: argparse.Namespace) -> None:
         poses = load_poses(np.load(poses_file))
         if len(poses) > len(frame_paths):
             poses = poses[:len(frame_paths)]
+
+        # 尝试读回 sfm_meta（关键帧 / 回环 / 帧状态），供稠密重建使用
+        if sfm_meta_path.exists():
+            try:
+                _m = json.loads(sfm_meta_path.read_text())
+                cached_keyframes = _m.get("keyframes")
+                cached_loop_closures = [tuple(x) for x in _m.get("loop_closures", [])]
+                cached_frame_status = _m.get("frame_status")
+            except Exception as e:
+                logger.warning("读取 sfm_meta.json 失败: %s", e)
+
         logger.info(
             "已从 %s 加载 SfM 快照（intrinsics / poses / sparse_points），跳过位姿估计",
             workdir,
@@ -300,6 +316,18 @@ def run_pipeline(args: argparse.Namespace) -> None:
             sparse_points = np.zeros((0, 3), dtype=np.float32)
         np.save(sparse_file, sparse_points)
 
+        # 落盘 sfm_meta：关键帧 / 回环 / 帧状态，供复用缓存时还原
+        try:
+            sfm_meta_path.write_text(json.dumps({
+                "keyframes": list(sfm_result.keyframes),
+                "loop_closures": [[int(a), int(b)]
+                                  for a, b in sfm_result.loop_closures],
+                "frame_status": (list(sfm_result.frame_status)
+                                 if sfm_result.frame_status else None),
+            }, ensure_ascii=False))
+        except Exception as e:
+            logger.warning("写入 sfm_meta.json 失败: %s", e)
+
     while len(poses) < len(frame_paths):
         poses.append(None)
 
@@ -333,7 +361,11 @@ def run_pipeline(args: argparse.Namespace) -> None:
             enable_dense = False
             n_steps = 3
         else:
-            _kf = list(sfm_result.keyframes) if (sfm_result and sfm_result.keyframes) else None
+            # 关键帧选择：优先当前 SfM 结果，否则回退缓存
+            if sfm_result is not None and sfm_result.keyframes:
+                _kf = list(sfm_result.keyframes)
+            else:
+                _kf = cached_keyframes
             _intr = sfm_result.intrinsics if sfm_result else intr_from_K(K)
 
             dense_cfg = DenseConfig(
@@ -343,7 +375,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
             )
             dense_path = output_dir / "dense_points.ply"
 
-            # Ctrl+C → 置位 stop_event；dense 内部会 flush 后抛 DenseAbortedError
             stop_event = threading.Event()
             _old_sigint = signal.getsignal(signal.SIGINT)
 
@@ -370,7 +401,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
                     dense_result.elapsed_sec,
                 )
             except DenseAbortedError:
-                # 稠密中断不丢弃稀疏成果：继续走导出流程
                 logger.info("稠密重建已中断，缓存已保存到 %s/dense_pairs", workdir)
                 logger.info("继续导出稀疏结果……")
                 dense_result = None
@@ -416,8 +446,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
             "num_sparse_points": int(np.asarray(sparse_points).shape[0]),
             "num_dense_points": int(dense_result.num_points) if dense_result else 0,
             "dense_pairs_used": int(dense_result.num_pairs_used) if dense_result else 0,
-            "num_keyframes": (len(sfm_result.keyframes) if sfm_result else 0),
-            "num_loop_closures": (len(sfm_result.loop_closures) if sfm_result else 0),
+            "num_keyframes": (len(sfm_result.keyframes) if sfm_result
+                              else (len(cached_keyframes) if cached_keyframes else 0)),
+            "num_loop_closures": (len(sfm_result.loop_closures) if sfm_result
+                                  else len(cached_loop_closures)),
             "feature_type": args.feature_type,
             "image_width": int(w),
             "image_height": int(h),

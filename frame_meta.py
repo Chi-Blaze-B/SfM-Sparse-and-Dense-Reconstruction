@@ -64,18 +64,63 @@ def check_meta(meta_path: Path, cfg: Dict[str, Any]) -> List[str]:
     return reasons
 
 
+def can_reuse_frames(workdir: Path) -> bool:
+    """判断工作目录的抽帧缓存是否可复用。
+
+    同时校验 frame_paths.txt、frames/ 目录存在且非空，
+    避免 frame_paths.txt 残留但帧文件已被删除的场景。
+
+    CLI / GUI 共用此函数，保证行为一致。
+    """
+    workdir = Path(workdir)
+    frame_paths_file = workdir / "frame_paths.txt"
+    frame_dir = workdir / "frames"
+    if not frame_paths_file.exists():
+        return False
+    if not frame_dir.exists() or not frame_dir.is_dir():
+        return False
+    try:
+        if not any(frame_dir.iterdir()):
+            return False
+    except OSError:
+        return False
+    return True
+
+
 def invalidate_downstream(workdir: Path) -> List[str]:
     """删除因抽帧参数变化而失效的下游缓存。
 
+    同时清空稠密帧对缓存，因为帧变化会使稠密结果不再可信。
     返回被删除的文件名列表。
     """
     removed: List[str] = []
-    for name in ("intrinsics.npy", "poses.npy", "sparse_points.npy"):
-        p = Path(workdir) / name
+    workdir = Path(workdir)
+    for name in ("intrinsics.npy", "poses.npy", "sparse_points.npy",
+                 "sfm_meta.json"):
+        p = workdir / name
         try:
             if p.exists():
                 p.unlink()
                 removed.append(name)
         except OSError:
             pass
+
+    # 稠密帧对缓存也失效（帧变化会影响 SGBM 输入）
+    dense_pairs = workdir / "dense_pairs"
+    if dense_pairs.exists() and dense_pairs.is_dir():
+        n = 0
+        for f in dense_pairs.glob("pair_*.npz"):
+            try:
+                f.unlink()
+                n += 1
+            except OSError:
+                pass
+        meta = dense_pairs / "meta.json"
+        try:
+            if meta.exists():
+                meta.unlink()
+        except OSError:
+            pass
+        if n > 0:
+            removed.append(f"dense_pairs/（{n} 个帧对）")
     return removed

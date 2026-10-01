@@ -820,11 +820,7 @@ class PipelineWorker(QThread):
         output_dir = Path(c["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        has_frames = (
-            (workdir / "frame_paths.txt").exists()
-            and frame_dir.exists()
-            and any(frame_dir.iterdir())
-        )
+        has_frames = frame_meta.can_reuse_frames(workdir)
         has_poses = (
             (workdir / "intrinsics.npy").exists()
             and (workdir / "poses.npy").exists()
@@ -912,6 +908,11 @@ class PipelineWorker(QThread):
 
         sfm_result = None
         K = None
+        cached_keyframes = None
+        cached_loop_closures = []
+        cached_frame_status = None
+
+        sfm_meta_path = workdir / "sfm_meta.json"
 
         if has_poses:
             try:
@@ -928,6 +929,17 @@ class PipelineWorker(QThread):
                     poses = poses[:len(frame_paths)]
                 while len(poses) < len(frame_paths):
                     poses.append(None)
+
+                # 尝试读回 sfm_meta（关键帧 / 回环 / 帧状态）
+                if sfm_meta_path.exists():
+                    try:
+                        _m = json.loads(sfm_meta_path.read_text())
+                        cached_keyframes = _m.get("keyframes")
+                        cached_loop_closures = [tuple(x)
+                                                for x in _m.get("loop_closures", [])]
+                        cached_frame_status = _m.get("frame_status")
+                    except Exception as e:
+                        self._log(f"  ⚠️  读取 sfm_meta.json 失败: {e}")
 
                 n_loaded_valid = sum(1 for p in poses if p is not None)
                 self._log(
@@ -980,7 +992,6 @@ class PipelineWorker(QThread):
                         f"  ⚠️  超过 30% 的帧丢失/无效（{_n_lost} / {len(frame_paths)}），"
                         f"建议更换素材。"
                     )
-
             np.save(workdir / "intrinsics.npy", K)
             poses_arr = np.full((len(poses), 4, 4), np.nan, dtype=np.float32)
             for i, p in enumerate(poses):
@@ -991,6 +1002,18 @@ class PipelineWorker(QThread):
             if sparse_points is None:
                 sparse_points = np.zeros((0, 3), dtype=np.float32)
             np.save(workdir / "sparse_points.npy", sparse_points)
+
+            # sfm_meta：关键帧 / 回环 / 帧状态
+            try:
+                sfm_meta_path.write_text(json.dumps({
+                    "keyframes": list(sfm_result.keyframes),
+                    "loop_closures": [[int(a), int(b)]
+                                      for a, b in sfm_result.loop_closures],
+                    "frame_status": (list(sfm_result.frame_status)
+                                     if sfm_result.frame_status else None),
+                }, ensure_ascii=False))
+            except Exception as e:
+                self._log(f"  ⚠️  写入 sfm_meta.json 失败: {e}")
 
         while len(poses) < len(frame_paths):
             poses.append(None)
@@ -1038,7 +1061,10 @@ class PipelineWorker(QThread):
                 enable_dense = False
                 n_steps = 3
             else:
-                _kf = list(sfm_result.keyframes) if (sfm_result and sfm_result.keyframes) else None
+                if sfm_result is not None and sfm_result.keyframes:
+                    _kf = list(sfm_result.keyframes)
+                else:
+                    _kf = cached_keyframes
                 _intr = sfm_result.intrinsics if sfm_result else intr_from_K(K)
 
                 dense_cfg = DenseConfig(
