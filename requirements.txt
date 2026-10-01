@@ -1,0 +1,14 @@
+# Structure from Motion Reconstruction — 核心依赖
+#
+# 说明：
+#   · 本项目自带完整 SfM 管线（特征提取 / 匹配 / 本质矩阵 / 三角化 /PnP 重定位 / BA / 回环 / PGO），不依赖任何外部 SfM 工具。
+#   · OpenCV 使用 headless 版本（避免与 PySide6 的 Qt 冲突）。
+#   · 不含 PyTorch：SfM 纯 CPU 即可运行，无需 GPU。
+#   · 建议 Python 3.11。
+
+numpy>=1.24.0
+scipy>=1.10.0
+opencv-python-headless>=4.8.0
+PySide6>=6.5.0
+matplotlib>=3.7.0
+psutil>=5.9.0
