@@ -1,18 +1,37 @@
-<h1 align="center"><strong>SfM Sparse & Dense Reconstruction</strong></h1>
+<h1 align="center"><strong>SfM Sparse &amp; Dense Reconstruction</strong></h1>
 
 <p align="center">
+  <!-- 项目 -->
   <img src="https://img.shields.io/badge/🌟_SfM-Sparse_%26_Dense-FF6F00?style=flat-square&logo=github&logoColor=white" alt="Project">
   <br><br>
+  <!-- 核心依赖 -->
   <img src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/NumPy-1.24+-4DABCF?style=flat-square&logo=numpy&logoColor=white" alt="NumPy">
+  <img src="https://img.shields.io/badge/SciPy-1.10+-0054A6?style=flat-square&logo=scipy&logoColor=white" alt="SciPy">
   <img src="https://img.shields.io/badge/OpenCV-4.8+-5C3EE8?style=flat-square&logo=opencv&logoColor=white" alt="OpenCV">
-  <img src="https://img.shields.io/badge/SciPy-1.10+-8CAAE6?style=flat-square&logo=scipy&logoColor=white" alt="SciPy">
+  <img src="https://img.shields.io/badge/PySide6-6.5+-2CDE85?style=flat-square&logo=qt&logoColor=white" alt="PySide6">
   <br><br>
-  <img src="https://img.shields.io/badge/GUI-PySide6-8A2BE2?style=flat-square&logo=qt&logoColor=white" alt="GUI">
-  <img src="https://img.shields.io/badge/SfM-ORB_|_SIFT-00A98F?style=flat-square" alt="SfM">
+  <!-- 核心功能 -->
+  <img src="https://img.shields.io/badge/SfM-ORB_%7C_SIFT-00A98F?style=flat-square" alt="SfM">
   <img src="https://img.shields.io/badge/MVS-SGBM-FF4500?style=flat-square" alt="MVS">
   <br><br>
-  <img src="https://img.shields.io/badge/Platform-Windows_|_Linux_|_macOS-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Platform">
+  <!-- 兼容性与许可证 -->
+  <img src="https://img.shields.io/badge/Platform-Windows_%7C_Linux_%7C_macOS-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Platform">
   <img src="https://img.shields.io/badge/License-Apache_2.0-1E90FF?style=flat-square&logo=apache&logoColor=white" alt="License">
+  <br><br>
+  <!-- 社区动态 -->
+  <a href="https://github.com/Chi-Blaze-B/SfM-Sparse-and-Dense-Reconstruction/stargazers">
+    <img src="https://img.shields.io/github/stars/Chi-Blaze-B/SfM-Sparse-and-Dense-Reconstruction?style=flat-square&color=yellow&logo=github" alt="Stars">
+  </a>
+  <a href="https://github.com/Chi-Blaze-B/SfM-Sparse-and-Dense-Reconstruction/network/members">
+    <img src="https://img.shields.io/github/forks/Chi-Blaze-B/SfM-Sparse-and-Dense-Reconstruction?style=flat-square&color=blue&logo=github" alt="Forks">
+  </a>
+  <a href="https://github.com/Chi-Blaze-B/SfM-Sparse-and-Dense-Reconstruction/issues">
+    <img src="https://img.shields.io/github/issues/Chi-Blaze-B/SfM-Sparse-and-Dense-Reconstruction?style=flat-square&color=red&logo=github" alt="Issues">
+  </a>
+  <a href="https://github.com/Chi-Blaze-B/SfM-Sparse-and-Dense-Reconstruction/commits">
+    <img src="https://img.shields.io/github/last-commit/Chi-Blaze-B/SfM-Sparse-and-Dense-Reconstruction?style=flat-square&color=green&logo=github" alt="Last Commit">
+  </a>
 </p>
 
 基于 Python 的视频转 SfM 稀疏 / 稠密点云工作流。输入一段视频，输出稀疏点云或稀疏 + 稠密点云，可用 MeshLab、CloudCompare 等工具浏览。
