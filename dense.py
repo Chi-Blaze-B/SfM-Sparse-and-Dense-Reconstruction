@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import cv2
+from frame_cache import get_image
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -493,8 +494,8 @@ def _process_pair(
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     """处理一对图像：立体校正 → SGBM → 反投影到世界坐标。"""
     # ---- 读图 + 降采样 ----
-    img_l = cv2.imread(path_l, cv2.IMREAD_COLOR)
-    img_r = cv2.imread(path_r, cv2.IMREAD_COLOR)
+    img_l = get_image(path_l)
+    img_r = get_image(path_r)
     if img_l is None or img_r is None:
         return None
 

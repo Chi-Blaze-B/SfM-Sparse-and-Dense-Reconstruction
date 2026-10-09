@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import json
 from pathlib import Path
 from io import BytesIO
@@ -49,6 +50,16 @@ from PySide6.QtCore import Qt, QThread, Signal, QPoint, QPropertyAnimation, QTim
 from PySide6.QtGui import QPixmap, QImage, QFont, QColor, QPainter
 
 from frames import extract_frames
+try:
+    from frame_cache import (
+        get_image as _cached_get_image,
+        configure as _configure_cache,
+        cache_stats as _cache_stats,
+    )
+except ImportError:
+    _cached_get_image = None
+    _configure_cache = None
+    _cache_stats = None
 from poses import estimate_poses, CameraPose, FrameStatus
 from exporter import (
     intr_from_K,
@@ -880,25 +891,48 @@ class PipelineWorker(QThread):
             frame_meta.write_meta(meta_path, current_meta)
             self._log(f"  已提取 {len(frame_paths)} 帧")
 
-        self.frame_paths_signal.emit(frame_paths)
-
-        if self._stop_event.is_set():
-            self._log("  用户已取消")
-            self.finished_signal.emit(False, "已取消")
-            return
-
         if len(frame_paths) < 2:
             self._log("  错误: 至少需要 2 帧。")
             self.finished_signal.emit(False, "帧数不足")
             return
 
-        _img = cv2.imread(frame_paths[0])
+        # ---- 帧图像内存缓存：先按配置建立缓存（不预加载） ----
+        _cache_mb = int(c.get("frame_cache_mb", 1500))
+        if _configure_cache is not None and _cache_mb > 0:
+            _configure_cache(max_bytes=_cache_mb * 1024 * 1024)
+
+        # 用缓存读首帧测分辨率（此时缓存已按用户配置生效）
+        if _cached_get_image is not None:
+            _img = _cached_get_image(frame_paths[0])
+        else:
+            _img = cv2.imread(frame_paths[0])
         if _img is None:
             self._log("  错误: 无法读取首帧。")
             self.finished_signal.emit(False, "无法读取帧")
             return
         h, w = _img.shape[:2]
         self._log(f"  分辨率: {w}x{h}")
+
+        # ---- 帧图像内存缓存：预加载 ----
+        if _configure_cache is not None:
+            if _cache_mb > 0:
+                t_cache = time.time()
+                _configure_cache(max_bytes=_cache_mb * 1024 * 1024,
+                                 preload=frame_paths)
+                self._log(
+                    f"  帧图像已预加载到内存（上限 {_cache_mb} MiB，"
+                    f"耗时 {time.time() - t_cache:.1f}s）"
+                )
+            else:
+                _configure_cache(max_bytes=0)
+                self._log("  帧缓存已禁用（逐次读盘）")
+
+        self.frame_paths_signal.emit(frame_paths)
+
+        if self._stop_event.is_set():
+            self._log("  用户已取消")
+            self.finished_signal.emit(False, "已取消")
+            return
 
         self._set_progress(15, f"{len(frame_paths)} 帧就绪")
 
@@ -959,17 +993,17 @@ class PipelineWorker(QThread):
                 self._log(f"  初始焦距猜测: {focal_guess:.1f}px（约 {fov_deg:.0f}° {axis} FOV）")
 
             feature_type = c.get("feature_type", "orb")
-            label = "SIFT" if feature_type == "sift" else "ORB"
+            label = {"orb": "ORB", "sift": "SIFT", "rootsift": "RootSIFT"}.get(feature_type, feature_type.upper())
             self._log(f"  使用 {label} + E + EM-BA 进行位姿估算...")
             try:
                 sfm_result = estimate_poses(
                     frame_paths,
-                    min_inliers=25,
-                    feature_type=feature_type,
+                    feature_type,
                     focal_guess=focal_guess,
                     aspect_ratio=1.0,
                     enable_loop=c.get("enable_loop", True),
                     enable_pgo=c.get("enable_pgo", True),
+                    enable_global_matching=c.get("enable_global_matching", False),
                 )
                 K = sfm_result.intrinsics.K
                 poses = sfm_result.poses
@@ -987,9 +1021,9 @@ class PipelineWorker(QThread):
                 self._log(f"  SfM 关键帧: {len(sfm_result.keyframes)} / {len(frame_paths)}")
                 self._log(f"  SfM 回环: {len(sfm_result.loop_closures)} 处")
                 _n_lost = _st.get(FrameStatus.LOST, 0) + _st.get(FrameStatus.INVALID, 0)
-                if _n_lost > len(frame_paths) * 0.3:
+                if _n_lost > len(frame_paths) * 0.4:
                     self._log(
-                        f"  ⚠️  超过 30% 的帧丢失/无效（{_n_lost} / {len(frame_paths)}），"
+                        f"  ⚠️  超过 40% 的帧丢失/无效（{_n_lost} / {len(frame_paths)}），"
                         f"建议更换素材。"
                     )
             np.save(workdir / "intrinsics.npy", K)
@@ -1153,6 +1187,18 @@ class PipelineWorker(QThread):
             self._log(f"  [WARN] 报告导出失败: {e}")
 
         self._log(f"\n完成！输出目录: {os.path.abspath(output_dir)}")
+        if _cache_stats is not None:
+            try:
+                _st = _cache_stats()
+                self._log(
+                    f"🧠  帧缓存统计: 命中 {_st['hits']} / 未命中 {_st['misses']}"
+                    f"（命中率 {_st['hit_rate'] * 100:.1f}%），"
+                    f"驱逐 {_st['evictions']}，"
+                    f"占用 {_st['bytes'] / 1048576:.1f} / "
+                    f"{_st['max_bytes'] / 1048576:.1f} MiB"
+                )
+            except Exception:
+                pass
         self._set_progress(100, "完成！")
         self.finished_signal.emit(True, "成功")
 
@@ -1525,10 +1571,11 @@ class MainWindow(QMainWindow):
         # ---- 相机位姿估算 ----
         self.feature_type_label = StyledLabel("特征描述子:", font_size=11, color=C["text_secondary"])
         self.feature_type_combo = StyledComboBox()
-        self.feature_type_combo.addItems(["ORB（快）", "SIFT（稳）"])
+        self.feature_type_combo.addItems(["ORB（快）", "SIFT（稳）", "RootSIFT（稳+）"])
         self.feature_type_combo.setToolTip(
             "ORB：二进制描述子，Hamming 距离匹配，速度快。\n"
-            "SIFT：浮点描述子，L2 距离匹配，更稳健但较慢。"
+            "SIFT：浮点描述子，L2 距离匹配，更稳健但较慢。\n"
+            "RootSIFT：SIFT 归一化版本，匹配更稳，速度与 SIFT 相当。"
         )
 
         self.focal_guess_label = StyledLabel("初始焦距:", font_size=11, color=C["text_secondary"])
@@ -1555,12 +1602,23 @@ class MainWindow(QMainWindow):
         self.pgo_cb.setToolTip("在全局 BA 之后对关键帧位姿做位姿图优化（Huber 核）。")
         self.pgo_label = StyledLabel("位姿图优化:", font_size=11, color=C["text_secondary"])
 
+        self.global_match_cb = QCheckBox("启用全局匹配")
+        self.global_match_cb.setChecked(False)
+        self.global_match_cb.setStyleSheet(f"color: {C['text_primary']}; font-size: 11px; font-weight: 500;")
+        self.global_match_cb.setToolTip(
+            "启用全局词袋检索匹配：除相邻帧外，还会在历史关键帧中检索共视候选做匹配。\n"
+            "更稳（尤其长序列、宽基线、回环场景），但耗时明显增加。\n"
+            "默认关闭。"
+        )
+        self.global_match_label = StyledLabel("全局匹配:", font_size=11, color=C["text_secondary"])
+
         cl.addWidget(self._make_step_header("相机位姿估算"))
         f2 = self._make_form()
         f2.addRow(self.feature_type_label, self.feature_type_combo)
         f2.addRow(self.focal_guess_label, self.focal_guess_cb)
         f2.addRow(self.loop_label, self.loop_cb)
         f2.addRow(self.pgo_label, self.pgo_cb)
+        f2.addRow(self.global_match_label, self.global_match_cb)
         cl.addLayout(f2)
 
         # ---- 稠密参数（仅 dense 模式可见） ----
@@ -1596,6 +1654,35 @@ class MainWindow(QMainWindow):
         dp.addLayout(f3)
         cl.addWidget(self.dense_param_widget)
 
+        # ---- 性能（帧图像内存缓存） ----
+        cl.addWidget(self._make_step_header("性能"))
+
+        self.frame_cache_spin = StyledSpinBox()
+        self.frame_cache_spin.setRange(0, 16384)
+        self.frame_cache_spin.setValue(1500)
+        self.frame_cache_spin.setSingleStep(256)
+        self.frame_cache_spin.setToolTip(
+            "帧图像内存缓存上限（MiB）。\n"
+            "抽帧完成后一次性预加载到内存，避免位姿估计 / 稠密重建 /\n"
+            "帧预览缩略图对同一帧反复读盘 + 解码。\n"
+            "设为 0 表示禁用缓存（退回逐次 cv2.imread）。\n"
+            "参考：scale=0.5 的 1080p 帧约 1.5 MiB/帧，1500 MiB 约可缓存 1000 帧。"
+        )
+
+        f4 = self._make_form()
+        f4.addRow(
+            StyledLabel("帧缓存上限(MiB):", font_size=11, color=C["text_secondary"]),
+            self.frame_cache_spin,
+        )
+        cl.addLayout(f4)
+
+        self.frame_cache_hint = StyledLabel("", font_size=10, color=C["text_muted"])
+        self.frame_cache_hint.setWordWrap(True)
+        cl.addWidget(self.frame_cache_hint)
+
+        self.frame_cache_spin.valueChanged.connect(self._refresh_frame_cache_hint)
+        self._refresh_frame_cache_hint(self.frame_cache_spin.value())
+
         parent_layout.addWidget(card)
 
         self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
@@ -1604,6 +1691,29 @@ class MainWindow(QMainWindow):
     def _on_mode_changed(self, text: str):
         is_dense = "稠密" in text
         self.dense_param_widget.setVisible(is_dense)
+
+    def _refresh_frame_cache_hint(self, val: int):
+        base = "font-size: 10pt; font-family: 'Microsoft YaHei UI', 'Segoe UI', sans-serif;"
+        if val <= 0:
+            self.frame_cache_hint.setText(
+                "○ 缓存已禁用：每帧将逐次从磁盘读取（省内存，慢）"
+            )
+            self.frame_cache_hint.setStyleSheet(f"color: {C['text_muted']}; {base}")
+        elif val < 512:
+            self.frame_cache_hint.setText(
+                f"⚠ 缓存偏小（{val} MiB）：长序列会频繁淘汰，命中率下降"
+            )
+            self.frame_cache_hint.setStyleSheet(f"color: {C['danger']}; {base}")
+        elif val < 1024:
+            self.frame_cache_hint.setText(
+                f"○ 缓存 {val} MiB：约可容纳 340 帧 1080p（scale=0.5）"
+            )
+            self.frame_cache_hint.setStyleSheet(f"color: {C['text_secondary']}; {base}")
+        else:
+            self.frame_cache_hint.setText(
+                f"✓ 缓存 {val} MiB：约可容纳 {int(val / 1.5)} 帧 1080p（scale=0.5）"
+            )
+            self.frame_cache_hint.setStyleSheet(f"color: {C['success']}; {base}")
 
     def _apply_theme(self):
         self.setStyleSheet(f"""
@@ -1671,7 +1781,8 @@ class MainWindow(QMainWindow):
         mode_map = {"均匀采样": "uniform", "智能采样": "smart", "两阶段采样": "two-stage"}
         sampling_mode = mode_map.get(self.sampling_combo.currentText(), "uniform")
 
-        feature_type = "sift" if self.feature_type_combo.currentIndex() == 1 else "orb"
+        _ft_idx = self.feature_type_combo.currentIndex()
+        feature_type = {0: "orb", 1: "sift", 2: "rootsift"}.get(_ft_idx, "orb")
         run_mode = "dense" if "稠密" in self.mode_combo.currentText() else "sparse"
 
         config = {
@@ -1687,10 +1798,12 @@ class MainWindow(QMainWindow):
             "use_focal_guess": self.focal_guess_cb.isChecked(),
             "enable_loop": self.loop_cb.isChecked(),
             "enable_pgo": self.pgo_cb.isChecked(),
+            "enable_global_matching": self.global_match_cb.isChecked(),
             "feature_type": feature_type,
             "dense_downscale": self.dense_downscale_spin.value(),
             "dense_max_pairs": self.dense_pairs_spin.value(),
             "dense_voxel_ratio": self.dense_voxel_spin.value(),
+            "frame_cache_mb": self.frame_cache_spin.value(),
         }
 
         self.start_btn.setEnabled(False)
@@ -1718,6 +1831,12 @@ class MainWindow(QMainWindow):
         self._log(f"🔍  初始焦距猜测: {'开（1.0×长边）' if config['use_focal_guess'] else '关'}")
         self._log(f"🔁  回环检测:  {'开' if config['enable_loop'] else '关'}")
         self._log(f"🧭  位姿图优化: {'开' if config['enable_pgo'] else '关'}")
+        self._log(f"🌐  全局匹配:  {'开' if config['enable_global_matching'] else '关'}")
+        _fcmb = config["frame_cache_mb"]
+        if _fcmb <= 0:
+            self._log("🧠  帧缓存:     已禁用")
+        else:
+            self._log(f"🧠  帧缓存:     {_fcmb} MiB（预加载到内存）")
         if run_mode == "dense":
             self._log(
                 f"🧊  稠密参数:  降采样 ×{config['dense_downscale']}，"
@@ -1861,11 +1980,17 @@ class MainWindow(QMainWindow):
                 self.thumb_layout.addLayout(row)
 
             try:
-                img = cv2.imread(fp)
+                if _cached_get_image is not None:
+                    img = _cached_get_image(fp)
+                else:
+                    img = cv2.imread(fp)
                 if img is None:
                     continue
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                pix = QPixmap.fromImage(QImage(img.tobytes(), img.shape[1], img.shape[0], img.shape[1] * 3, QImage.Format_RGB888))
+                pix = QPixmap.fromImage(QImage(
+                    img.tobytes(), img.shape[1], img.shape[0],
+                    img.shape[1] * 3, QImage.Format_RGB888,
+                ))
                 pix = pix.scaled(180, 130, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
                 lbl = QLabel()

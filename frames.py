@@ -326,8 +326,10 @@ def _two_stage_extract(
         try:
             # 粗位姿只为视差加权用，禁掉回环/PGO
             coarse_result = estimate_poses(
-                coarse_paths, min_inliers=10, feature_type=feature_type,
-                enable_loop=False, enable_pgo=False,
+            coarse_paths, feature_type,
+            enable_loop=False,
+            enable_pgo=False,
+            enable_global_matching=False,        # ← 显式关闭（粗位姿用不到）
             )
             coarse_poses = coarse_result.poses
         except Exception as e:

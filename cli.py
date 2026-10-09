@@ -77,8 +77,8 @@ def build_parser() -> argparse.ArgumentParser:
     # 位姿估计
     parser.add_argument(
         "--feature-type", type=str,
-        choices=["orb", "sift"], default="orb",
-        help="特征描述子（orb=快速二进制，sift=鲁棒浮点，较慢）",
+        choices=["orb", "sift", "rootsift"], default="orb",
+        help="特征描述子（orb=快速二进制，sift=鲁棒浮点，rootsift=SIFT 归一化，较慢）",
     )
     parser.add_argument(
         "--use-focal-guess", action="store_true",
@@ -91,6 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-pgo", action="store_true",
         help="关闭位姿图优化（无回环时收益有限）",
+    )
+    parser.add_argument(
+        "--enable-global-matching", action="store_true",
+        help="启用全局词袋检索匹配（更稳但更慢，长序列建议开启）",
     )
 
     # 稠密重建参数（仅 --mode dense 时生效）
@@ -105,6 +109,12 @@ def build_parser() -> argparse.ArgumentParser:
     # 缓存复用
     parser.add_argument("--reuse-dir", type=str, default=None,
                         help="复用指定工作目录的中间产物（帧 / 位姿缓存），跳过已完成步骤")
+
+    # 帧图像内存缓存
+    parser.add_argument(
+        "--frame-cache-mb", type=int, default=1500,
+        help="帧图像内存缓存上限（MiB）；0 表示禁用。用于加速重复读取",
+    )
 
     return parser
 
@@ -169,7 +179,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
     meta_path = workdir / "frame_meta.json"
     sfm_meta_path = workdir / "sfm_meta.json"
 
-    # CLI / GUI 统一：同时校验 frame_paths.txt 与 frames/ 目录
     can_reuse_frames = frame_meta.can_reuse_frames(workdir)
 
     current_meta = {
@@ -223,13 +232,45 @@ def run_pipeline(args: argparse.Namespace) -> None:
         logger.error("至少需要 2 帧。")
         sys.exit(1)
 
-    import cv2
-    _img = cv2.imread(frame_paths[0])
+    # ---- 帧缓存：先按配置建好缓存实例（不预加载），再读首帧测尺寸 ----
+    cache_mb = int(getattr(args, "frame_cache_mb", 1500))
+    try:
+        from frame_cache import (
+            configure as _configure_cache,
+            cache_stats as _cache_stats,
+            get_image as _get_image,
+        )
+    except ImportError:
+        _configure_cache = None
+        _cache_stats = None
+        _get_image = None
+
+    if _configure_cache is not None and cache_mb > 0:
+        _configure_cache(max_bytes=cache_mb * 1024 * 1024)
+
+    # 读首帧测尺寸（走缓存；禁用缓存时退化到 cv2.imread）
+    if _get_image is not None:
+        _img = _get_image(frame_paths[0])
+    else:
+        import cv2 as _cv2
+        _img = _cv2.imread(frame_paths[0])
     if _img is None:
         logger.error("无法读取首帧: %s", frame_paths[0])
         sys.exit(1)
     h, w = _img.shape[:2]
     logger.info("帧分辨率: %dx%d", w, h)
+
+    # ---- 帧缓存：预加载到内存，加速位姿估计 / 稠密重建的重复读盘 ----
+    if _configure_cache is not None:
+        if cache_mb > 0:
+            t_cache = time.time()
+            _configure_cache(max_bytes=cache_mb * 1024 * 1024,
+                             preload=frame_paths)
+            logger.info("帧图像已预加载到内存（上限 %d MiB，耗时 %.1fs）",
+                        cache_mb, time.time() - t_cache)
+        else:
+            _configure_cache(max_bytes=0)
+            logger.info("帧缓存已禁用（--frame-cache-mb 0）")
 
     # ---- 步骤 2：位姿估计 ----
     logger.info("[2/%d] 正在估计相机位姿...", n_steps)
@@ -251,7 +292,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
         if len(poses) > len(frame_paths):
             poses = poses[:len(frame_paths)]
 
-        # 尝试读回 sfm_meta（关键帧 / 回环 / 帧状态），供稠密重建使用
         if sfm_meta_path.exists():
             try:
                 _m = json.loads(sfm_meta_path.read_text())
@@ -277,12 +317,12 @@ def run_pipeline(args: argparse.Namespace) -> None:
         try:
             sfm_result = estimate_poses(
                 frame_paths,
-                min_inliers=25,
-                feature_type=args.feature_type,
+                args.feature_type,
                 focal_guess=focal_guess,
                 aspect_ratio=1.0,
                 enable_loop=not args.no_loop,
                 enable_pgo=not args.no_pgo,
+                enable_global_matching=args.enable_global_matching,
             )
             K = sfm_result.intrinsics.K
             poses = sfm_result.poses
@@ -304,9 +344,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 for a, b in sfm_result.loop_closures[:10]:
                     logger.info("  loop: %d ↔ %d", a, b)
             n_lost = st.get(FrameStatus.LOST, 0) + st.get(FrameStatus.INVALID, 0)
-            if n_lost > len(frame_paths) * 0.3:
+            if n_lost > len(frame_paths) * 0.4:
                 logger.warning(
-                    "超过 30%% 的帧丢失/无效（%d / %d），建议更换素材。",
+                    "超过 40% 的帧丢失/无效（%d / %d），建议更换素材。",
                     n_lost, len(frame_paths),
                 )
 
@@ -316,7 +356,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
             sparse_points = np.zeros((0, 3), dtype=np.float32)
         np.save(sparse_file, sparse_points)
 
-        # 落盘 sfm_meta：关键帧 / 回环 / 帧状态，供复用缓存时还原
         try:
             sfm_meta_path.write_text(json.dumps({
                 "keyframes": list(sfm_result.keyframes),
@@ -361,7 +400,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
             enable_dense = False
             n_steps = 3
         else:
-            # 关键帧选择：优先当前 SfM 结果，否则回退缓存
             if sfm_result is not None and sfm_result.keyframes:
                 _kf = list(sfm_result.keyframes)
             else:
@@ -463,6 +501,18 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logger.info("=" * 60)
     logger.info("完成！输出目录: %s", os.path.abspath(output_dir))
     logger.info("总耗时: %.1fs", total)
+    if _cache_stats is not None:
+        try:
+            _st = _cache_stats()
+            logger.info(
+                "帧缓存统计: 命中 %d / 未命中 %d（命中率 %.1f%%），"
+                "驱逐 %d，当前占用 %.1f / %.1f MiB",
+                _st["hits"], _st["misses"], _st["hit_rate"] * 100,
+                _st["evictions"],
+                _st["bytes"] / 1048576, _st["max_bytes"] / 1048576,
+            )
+        except Exception as e:
+            logger.debug("读取帧缓存统计失败: %s", e)
     logger.info("=" * 60)
 
 
