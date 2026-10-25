@@ -1,13 +1,4 @@
-"""SfM / 稠密重建结果导出工具。
-
-集中管理：
-  · 二进制 PLY（可选带 RGB）
-  · cameras.txt（位姿 + 四元数）
-  · intrinsics.json（内参）
-以及两个纯函数辅助：旋转矩阵→四元数、从 3×3 K 还原 CameraIntrinsics。
-
-只依赖 poses 的数据类，不反向依赖 gui / cli / dense。
-"""
+"""SfM / 稠密重建结果的导出工具。"""
 
 import json
 from pathlib import Path
@@ -18,12 +9,9 @@ import numpy as np
 from poses import CameraIntrinsics, CameraPose
 
 
-# ---------------------------------------------------------------------------
-# 纯函数
-# ---------------------------------------------------------------------------
-
+# ---- 纯函数 ----
 def rot_to_quat(R: np.ndarray):
-    """旋转矩阵 → (qx, qy, qz, qw)。"""
+    """输出顺序 qx, qy, qz, qw，与 cameras.txt 一致。"""
     R = np.asarray(R, dtype=np.float64)
     trace = R[0, 0] + R[1, 1] + R[2, 2]
     if trace > 0:
@@ -54,7 +42,7 @@ def rot_to_quat(R: np.ndarray):
 
 
 def intr_from_K(K: np.ndarray) -> CameraIntrinsics:
-    """从 3×3 内参矩阵还原 CameraIntrinsics（位姿走缓存时用）。"""
+    """从 3×3 矩阵还原内参，读缓存快照时用。"""
     K = np.asarray(K, dtype=np.float64)
     return CameraIntrinsics(
         fx=float(K[0, 0]), fy=float(K[1, 1]),
@@ -62,10 +50,7 @@ def intr_from_K(K: np.ndarray) -> CameraIntrinsics:
     )
 
 
-# ---------------------------------------------------------------------------
-# PLY
-# ---------------------------------------------------------------------------
-
+# ---- PLY ----
 _PLY_DTYPE_RGB = np.dtype([
     ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
     ("r", "u1"), ("g", "u1"), ("b", "u1"),
@@ -92,11 +77,7 @@ def _ply_header(n: int, *, with_color: bool) -> str:
 
 
 def write_ply(path, xyz: np.ndarray, rgb: Optional[np.ndarray] = None) -> None:
-    """写二进制 little-endian PLY。
-
-    rgb=None 时只写 x y z；否则写 x y z + red green blue。
-    无论主机字节序如何，均以小端输出（与 header 一致）。
-    """
+    """rgb=None 时只写坐标；字节序固定小端，与 header 一致。"""
     # 强制小端，避免大端机器上 header 与实际字节序不一致
     xyz = np.asarray(xyz, dtype="<f4")
     if xyz.ndim != 2 or xyz.shape[1] != 3:
@@ -125,16 +106,12 @@ def write_ply(path, xyz: np.ndarray, rgb: Optional[np.ndarray] = None) -> None:
             arr["r"], arr["g"], arr["b"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
             f.write(arr.tobytes())
         else:
-            # xyz 已强制 <f4，直接写就行
+            # xyz 已是 <f4，字节序与 header 一致
             f.write(xyz.tobytes())
 
 
-# ---------------------------------------------------------------------------
-# 相机位姿
-# ---------------------------------------------------------------------------
-
+# ---- 相机位姿 ----
 def write_cameras_txt(path, poses: Sequence[Optional[CameraPose]]) -> None:
-    """写 cameras.txt：frame_index tx ty tz qx qy qz qw。"""
     lines = [
         "# frame_index tx ty tz qx qy qz qw",
         "# 约定: X_cam = R @ X_world + t  (OpenCV 相机系)",
@@ -152,10 +129,7 @@ def write_cameras_txt(path, poses: Sequence[Optional[CameraPose]]) -> None:
     Path(path).write_text("\n".join(lines) + "\n")
 
 
-# ---------------------------------------------------------------------------
-# 内参
-# ---------------------------------------------------------------------------
-
+# ---- 内参 ----
 def write_intrinsics_json(path, K: np.ndarray, w: int, h: int) -> None:
     K = np.asarray(K, dtype=np.float64)
     data = {

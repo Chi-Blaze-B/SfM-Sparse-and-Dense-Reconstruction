@@ -1,4 +1,4 @@
-"""视频转 SfM 稀疏/稠密重建 — PySide6 图形界面。"""
+"""视频 / 图片集转 SfM 稀疏/稠密重建 — PySide6 图形界面。"""
 
 import logging
 import os
@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QPoint, QPropertyAnimation, QTimer
 from PySide6.QtGui import QPixmap, QImage, QFont, QColor, QPainter
 
-from frames import extract_frames
+from frames import extract_frames, import_images, list_images
 try:
     from frame_cache import (
         get_image as _cached_get_image,
@@ -70,9 +70,7 @@ from exporter import (
 import frame_meta
 
 
-# ---------------------------------------------------------------------------
-# 设计系统
-# ---------------------------------------------------------------------------
+# ---- 设计系统 ----
 C = {
     "bg":             "#0f1724",
     "bg_sidebar":     "#141e2c",
@@ -118,12 +116,8 @@ def input_fg():
     )
 
 
-# ---------------------------------------------------------------------------
-# 自定义控件
-# ---------------------------------------------------------------------------
-
+# ---- 自定义控件 ----
 class RoundedCard(QFrame):
-    """带圆角与阴影的卡片容器。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -149,7 +143,6 @@ class StyledLabel(QLabel):
 
 
 class StyledSpinBox(QWidget):
-    """带 +/- 按钮的整数输入框。"""
 
     valueChanged = Signal(int)
 
@@ -249,7 +242,6 @@ class StyledSpinBox(QWidget):
 
 
 class StyledDoubleSpinBox(QWidget):
-    """带 +/- 按钮的浮点输入框。"""
 
     valueChanged = Signal(float)
 
@@ -541,7 +533,7 @@ class ThinProgressBar(QProgressBar):
 
 
 class StatusDot(QWidget):
-    """状态圆点：idle 灰 / running 绿 / error 红 / done 绿。"""
+    """状态圆点配色：idle 灰，running/done 绿，error 红。"""
 
     def __init__(self, status="idle", parent=None):
         super().__init__(parent)
@@ -583,7 +575,6 @@ class LogViewer(QTextEdit):
 
 
 class PreviewImage(QLabel):
-    """视频预览占位图。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -591,7 +582,7 @@ class PreviewImage(QLabel):
         self.setMaximumSize(560, 380)
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet(f"QLabel {{ background-color: {C['bg']}; border: 2px dashed {C['border_light']}; border-radius: {RADIUS_CARD}px; color: {C['text_muted']}; font-size: 13px; }}")
-        self.setText("📷  选择视频以预览")
+        self.setText("📷  选择视频或图片集以预览")
 
     def set_image(self, img):
         if len(img.shape) == 2:
@@ -603,12 +594,9 @@ class PreviewImage(QLabel):
         self.setPixmap(QPixmap.fromImage(qimg).scaled(self.width() - 4, self.height() - 4, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
 
-# ---------------------------------------------------------------------------
-# 相机轨迹 / 点云可视化页
-# ---------------------------------------------------------------------------
-
+# ---- 轨迹与点云可视化 ----
 class TrajectoryPage(QWidget):
-    """两幅 matplotlib 图：相机轨迹 + 稀疏点云俯视投影。"""
+    """相机轨迹与稀疏点云两幅 matplotlib 图。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -740,7 +728,7 @@ class TrajectoryPage(QWidget):
                         ha="center", va="center", color=C["text_muted"], fontsize=12)
             else:
                 pts = np.asarray(xyz, dtype=np.float64)
-                # 采样避免过多散点拖慢渲染
+                # 超过 20000 点先采样，避免散点拖慢渲染
                 if pts.shape[0] > 20000:
                     idx = np.linspace(0, pts.shape[0] - 1, 20000).astype(int)
                     pts_plot = pts[idx]
@@ -778,10 +766,7 @@ class TrajectoryPage(QWidget):
         buf.close()
 
 
-# ---------------------------------------------------------------------------
-# 工作线程
-# ---------------------------------------------------------------------------
-
+# ---- 工作线程 ----
 class PipelineWorker(QThread):
     """后台执行 SfM 流水线（抽帧 → 位姿估计 → 稠密重建 → 导出）。"""
 
@@ -823,6 +808,7 @@ class PipelineWorker(QThread):
         run_mode = c.get("run_mode", "sparse")
         enable_dense = (run_mode == "dense")
         n_steps = 4 if enable_dense else 3
+        image_mode = c.get("source_type") == "images"
 
         workdir = Path(c["workdir"])
         workdir.mkdir(parents=True, exist_ok=True)
@@ -838,13 +824,16 @@ class PipelineWorker(QThread):
             and (workdir / "sparse_points.npy").exists()
         )
 
-        # ---- 步骤 1：抽帧 ----
-        self._log(f"[1/{n_steps}] 正在提取视频帧...")
-        self._set_progress(2, "正在提取视频帧...")
+        # ---- 步骤 1：抽帧 / 导入 ----
+        _step1_msg = "正在导入图片集..." if image_mode else "正在提取视频帧..."
+        self._log(f"[1/{n_steps}] {_step1_msg}")
+        self._set_progress(2, _step1_msg)
 
         meta_path = workdir / "frame_meta.json"
         current_meta = {
-            "video": os.path.abspath(c["video"]),
+            "source_type": "images" if image_mode else "video",
+            "video": None if image_mode else os.path.abspath(c["video"]),
+            "image_dir": os.path.abspath(c["image_dir"]) if image_mode else None,
             "scale": c["scale"],
             "fps": c["fps"],
             "sampling_mode": c["sampling_mode"],
@@ -870,6 +859,16 @@ class PipelineWorker(QThread):
         if has_frames:
             frame_paths = [p.strip() for p in (workdir / "frame_paths.txt").read_text().splitlines()]
             self._log(f"  已加载 {len(frame_paths)} 帧（跳过抽帧）")
+        elif image_mode:
+            frame_paths = import_images(
+                c["image_dir"],
+                output_dir=str(frame_dir),
+                scale=c["scale"],
+                max_frames=c["max_frames"],
+            )
+            (workdir / "frame_paths.txt").write_text("\n".join(frame_paths))
+            frame_meta.write_meta(meta_path, current_meta)
+            self._log(f"  已导入 {len(frame_paths)} 张图片")
         else:
             smart_sampling = c["sampling_mode"] != "uniform"
             two_stage = c["sampling_mode"] == "two-stage"
@@ -896,12 +895,12 @@ class PipelineWorker(QThread):
             self.finished_signal.emit(False, "帧数不足")
             return
 
-        # ---- 帧图像内存缓存：先按配置建立缓存（不预加载） ----
+        # ---- 帧缓存初始化 ----
         _cache_mb = int(c.get("frame_cache_mb", 1500))
         if _configure_cache is not None and _cache_mb > 0:
             _configure_cache(max_bytes=_cache_mb * 1024 * 1024)
 
-        # 用缓存读首帧测分辨率（此时缓存已按用户配置生效）
+        # 经缓存读首帧，顺带测分辨率
         if _cached_get_image is not None:
             _img = _cached_get_image(frame_paths[0])
         else:
@@ -913,7 +912,7 @@ class PipelineWorker(QThread):
         h, w = _img.shape[:2]
         self._log(f"  分辨率: {w}x{h}")
 
-        # ---- 帧图像内存缓存：预加载 ----
+        # ---- 帧缓存预加载 ----
         if _configure_cache is not None:
             if _cache_mb > 0:
                 t_cache = time.time()
@@ -964,7 +963,6 @@ class PipelineWorker(QThread):
                 while len(poses) < len(frame_paths):
                     poses.append(None)
 
-                # 尝试读回 sfm_meta（关键帧 / 回环 / 帧状态）
                 if sfm_meta_path.exists():
                     try:
                         _m = json.loads(sfm_meta_path.read_text())
@@ -1037,7 +1035,6 @@ class PipelineWorker(QThread):
                 sparse_points = np.zeros((0, 3), dtype=np.float32)
             np.save(workdir / "sparse_points.npy", sparse_points)
 
-            # sfm_meta：关键帧 / 回环 / 帧状态
             try:
                 sfm_meta_path.write_text(json.dumps({
                     "keyframes": list(sfm_result.keyframes),
@@ -1067,7 +1064,7 @@ class PipelineWorker(QThread):
             self.finished_signal.emit(False, "有效位姿过少")
             return
 
-        # 通知 GUI 绘制相机轨迹 / 点云（缓存命中时不再强切 tab）
+        # 通知 GUI 绘制轨迹与点云
         self.sfm_result_signal.emit({
             "poses": list(poses),
             "xyz": np.asarray(sparse_points),
@@ -1082,7 +1079,7 @@ class PipelineWorker(QThread):
             self.finished_signal.emit(False, "已取消")
             return
 
-        # ---- 步骤 3（可选）：稠密重建 ----
+        # ---- 步骤 3：稠密（可选） ----
         dense_result = None
         if enable_dense:
             self._log(f"\n[3/{n_steps}] 正在稠密重建...")
@@ -1139,7 +1136,7 @@ class PipelineWorker(QThread):
                 except Exception as e:
                     self._log(f"  [WARN] 稠密重建失败: {e}")
 
-        # ---- 步骤 4（或 3）：导出 ----
+        # ---- 步骤 4：导出 ----
         self._log(f"\n[{n_steps}/{n_steps}] 正在导出...")
         self._set_progress(92, "正在导出...")
 
@@ -1168,7 +1165,11 @@ class PipelineWorker(QThread):
 
         try:
             report = {
-                "video": os.path.abspath(c["video"]),
+                "source_type": c.get("source_type", "video"),
+                "video": (None if c.get("source_type") == "images"
+                          else os.path.abspath(c["video"])),
+                "image_dir": (os.path.abspath(c["image_dir"])
+                              if c.get("source_type") == "images" else None),
                 "run_mode": run_mode,
                 "num_frames": len(frame_paths),
                 "num_valid_poses": int(valid_count),
@@ -1203,17 +1204,13 @@ class PipelineWorker(QThread):
         self.finished_signal.emit(True, "成功")
 
 
-# ---------------------------------------------------------------------------
-# 主窗口
-# ---------------------------------------------------------------------------
-
+# ---- 主窗口 ----
 class MainWindow(QMainWindow):
-    """左侧参数栏 + 右侧多标签页（帧预览 / 运行日志 / 重建结果）。"""
 
     def __init__(self):
         super().__init__()
         self.worker = None
-        self.setWindowTitle("视频转 SfM 稀疏/稠密重建")
+        self.setWindowTitle("视频 / 图片集 → SfM 稀疏/稠密重建")
         self.resize(1300, 820)
         self._preview_paths = []
         self._preview_page = 0
@@ -1472,8 +1469,23 @@ class MainWindow(QMainWindow):
         cl.addWidget(StyledLabel("📁 输入 / 输出 · 开始前设置", font_size=12, bold=True, color=C["title"]))
 
         form = self._make_form()
-        form.addRow(StyledLabel("视频文件:", font_size=11, color=C["text_secondary"]),
-                    self._make_path_row("video", browse_kind="video"))
+
+        self.source_combo = StyledComboBox()
+        self.source_combo.addItems(["视频文件", "图片集目录"])
+        self.source_combo.setToolTip(
+            "视频文件：按帧率/采样策略从视频中抽帧。\n"
+            "图片集目录：直接使用目录中的图片（按文件名自然排序）。\n"
+            "  顶层没有图片时会自动递归查找子目录，\n"
+            "  因此也可以直接选 ETH3D 的 <scene> 或 <scene>/images。\n"
+            "图片集模式下采样模式/帧率/最少帧数不生效。"
+        )
+        form.addRow(StyledLabel("输入类型:", font_size=11, color=C["text_secondary"]),
+                    self.source_combo)
+
+        self._input_label = StyledLabel("视频文件:", font_size=11, color=C["text_secondary"])
+        form.addRow(self._input_label,
+                    self._make_path_row("source", browse_kind="source"))
+
         form.addRow(StyledLabel("输出目录:", font_size=11, color=C["text_secondary"]),
                     self._make_path_row("output_dir", default="./sfm_output", browse_kind="dir"))
         form.addRow(StyledLabel("工作目录:", font_size=11, color=C["text_secondary"]),
@@ -1489,6 +1501,43 @@ class MainWindow(QMainWindow):
 
         self.workdir_edit.textChanged.connect(self._refresh_cache_hint)
         self._refresh_cache_hint()
+        self.source_combo.currentTextChanged.connect(self._on_source_changed)
+
+    def _is_image_mode(self) -> bool:
+        return "图片集" in self.source_combo.currentText()
+
+    def _on_source_changed(self, text: str):
+        image_mode = "图片集" in text
+        prev = getattr(self, "_image_mode", False)
+        self._image_mode = image_mode
+
+        self._input_label.setText("图片集目录:" if image_mode else "视频文件:")
+        self.source_edit.setPlaceholderText(
+            "选择包含图片的文件夹（顶层无图片时自动递归查找）"
+            if image_mode else "选择视频文件"
+        )
+
+        # 采样模式 / 帧率 / 最少帧数仅视频有效
+        if hasattr(self, "_frame_form"):
+            for row in self._video_only_rows:
+                self._frame_form.setRowVisible(row, not image_mode)
+        if hasattr(self, "_max_frames_label"):
+            self._max_frames_label.setText(
+                "最多图片数:" if image_mode else "最多帧数:")
+
+        if hasattr(self, "max_frames_spin"):
+            if image_mode and not prev:
+                # 0 = 全部图片
+                self.max_frames_spin.setRange(0, 5000)
+                self.max_frames_spin.setValue(0)
+            elif not image_mode and prev:
+                self.max_frames_spin.setRange(10, 500)
+                self.max_frames_spin.setValue(200)
+
+        # 切换类型后原路径多半失效，清掉避免误用
+        if prev != image_mode:
+            self.source_edit.clear()
+            self.preview_widget.setText("📷  选择视频或图片集以预览")
 
     def _refresh_cache_hint(self):
         wd = self.workdir_edit.text().strip() or "./workdir"
@@ -1559,14 +1608,23 @@ class MainWindow(QMainWindow):
         self.max_frames_spin.setRange(10, 500)
         self.max_frames_spin.setValue(200)
 
-        cl.addWidget(self._make_step_header("帧提取"))
+        cl.addWidget(self._make_step_header("帧提取 / 图片集导入"))
         f1 = self._make_form()
         f1.addRow(StyledLabel("采样模式:", font_size=11, color=C["text_secondary"]), self.sampling_combo)
         f1.addRow(StyledLabel("采样帧率:", font_size=11, color=C["text_secondary"]), self.fps_spin)
         f1.addRow(StyledLabel("画面缩放:", font_size=11, color=C["text_secondary"]), self.scale_spin)
         f1.addRow(StyledLabel("最少帧数:", font_size=11, color=C["text_secondary"]), self.min_frames_spin)
-        f1.addRow(StyledLabel("最多帧数:", font_size=11, color=C["text_secondary"]), self.max_frames_spin)
+        self._max_frames_label = StyledLabel("最多帧数:", font_size=11, color=C["text_secondary"])
+        f1.addRow(self._max_frames_label, self.max_frames_spin)
         cl.addLayout(f1)
+
+        # 记录"仅视频有效"的行，供输入类型切换时显隐
+        self._frame_form = f1
+        self._video_only_rows = (0, 1, 3)
+        self.scale_spin.setToolTip(
+            "视频：抽帧后的缩放比例。\n"
+            "图片集：<1 时会解码缩放并写入工作目录；=1 时直接引用原图。"
+        )
 
         # ---- 相机位姿估算 ----
         self.feature_type_label = StyledLabel("特征描述子:", font_size=11, color=C["text_secondary"])
@@ -1621,7 +1679,7 @@ class MainWindow(QMainWindow):
         f2.addRow(self.global_match_label, self.global_match_cb)
         cl.addLayout(f2)
 
-        # ---- 稠密参数（仅 dense 模式可见） ----
+        # ---- 稠密参数（仅稠密模式） ----
         self.dense_param_widget = QWidget()
         dp = QVBoxLayout(self.dense_param_widget)
         dp.setContentsMargins(0, 0, 0, 0)
@@ -1654,7 +1712,7 @@ class MainWindow(QMainWindow):
         dp.addLayout(f3)
         cl.addWidget(self.dense_param_widget)
 
-        # ---- 性能（帧图像内存缓存） ----
+        # ---- 性能 ----
         cl.addWidget(self._make_step_header("性能"))
 
         self.frame_cache_spin = StyledSpinBox()
@@ -1736,6 +1794,20 @@ class MainWindow(QMainWindow):
             btn.style().polish(btn)
 
     def _browse_file(self, kind, target_edit):
+        if kind == "source":
+            if self._is_image_mode():
+                path = QFileDialog.getExistingDirectory(self, "选择图片集目录")
+                if path:
+                    target_edit.setText(path)
+                    self._show_images_preview(path)
+            else:
+                path, _ = QFileDialog.getOpenFileName(
+                    self, "选择视频", "",
+                    "视频文件 (*.mp4 *.avi *.mov *.mkv);;所有文件 (*)")
+                if path:
+                    target_edit.setText(path)
+                    self._show_single_preview(path)
+            return
         if kind == "video":
             path, _ = QFileDialog.getOpenFileName(self, "选择视频", "", "视频文件 (*.mp4 *.avi *.mov *.mkv);;所有文件 (*)")
         elif kind == "dir":
@@ -1747,8 +1819,19 @@ class MainWindow(QMainWindow):
             if kind == "video":
                 self._show_single_preview(path)
 
+    def _show_images_preview(self, image_dir):
+        try:
+            files = list_images(image_dir)
+            if not files:
+                return
+            img = cv2.imread(files[len(files) // 2], cv2.IMREAD_COLOR)
+            if img is not None:
+                self.preview_widget.set_image(img)
+        except Exception:
+            pass
+
     def _show_single_preview(self, vp):
-        """读取视频中间帧作为预览；失败时回退到第 0 帧。"""
+        """取视频中间帧作预览，失败回退第 0 帧。"""
         cap = None
         try:
             cap = cv2.VideoCapture(vp)
@@ -1770,11 +1853,16 @@ class MainWindow(QMainWindow):
                 cap.release()
 
     def _on_start(self):
-        video = self.video_edit.text().strip()
+        image_mode = self._is_image_mode()
+        source_path = self.source_edit.text().strip()
         output_dir = self.output_dir_edit.text().strip() or "./sfm_output"
         workdir = self.workdir_edit.text().strip() or "./workdir"
 
-        if not video or not os.path.isfile(video):
+        if image_mode:
+            if not source_path or not os.path.isdir(source_path):
+                QMessageBox.warning(self, "提示", "请选择有效的图片集目录。")
+                return
+        elif not source_path or not os.path.isfile(source_path):
             QMessageBox.warning(self, "提示", "请选择有效的视频文件。")
             return
 
@@ -1786,7 +1874,9 @@ class MainWindow(QMainWindow):
         run_mode = "dense" if "稠密" in self.mode_combo.currentText() else "sparse"
 
         config = {
-            "video": video,
+            "source_type": "images" if image_mode else "video",
+            "video": None if image_mode else source_path,
+            "image_dir": source_path if image_mode else None,
             "output_dir": output_dir,
             "workdir": workdir,
             "run_mode": run_mode,
@@ -1819,14 +1909,23 @@ class MainWindow(QMainWindow):
         self._log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         self._log("  SfM 重建 启动")
         self._log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        self._log(f"📹  视频:      {config['video']}")
+        if image_mode:
+            self._log(f"🖼  图片集:    {config['image_dir']}")
+        else:
+            self._log(f"📹  视频:      {config['video']}")
         self._log(f"💾  输出目录:  {config['output_dir']}")
         self._log(f"📂  工作目录:  {config['workdir']}")
         self._log(f"🧩  运行模式:  {'稀疏 + 稠密' if run_mode == 'dense' else '稀疏重建'}")
-        self._log(f"🎯  采样模式:  {config['sampling_mode']}")
-        self._log(f"⚙️   帧率:      {config['fps']} FPS")
-        self._log(f"📐  缩放比例:  {config['scale']:.2f}")
-        self._log(f"🎞️   帧数范围:  {config['min_frames']}–{config['max_frames']}")
+        if image_mode:
+            self._log(f"📐  缩放比例:  {config['scale']:.2f}"
+                      f"{'（直接引用原图）' if config['scale'] >= 0.999 else '（解码缩放后写盘）'}")
+            self._log(f"🖼  图片数量:  "
+                      f"{'全部' if config['max_frames'] <= 0 else config['max_frames']}")
+        else:
+            self._log(f"🎯  采样模式:  {config['sampling_mode']}")
+            self._log(f"⚙️   帧率:      {config['fps']} FPS")
+            self._log(f"📐  缩放比例:  {config['scale']:.2f}")
+            self._log(f"🎞️   帧数范围:  {config['min_frames']}–{config['max_frames']}")
         self._log(f"🔎  特征描述子: {config['feature_type'].upper()}")
         self._log(f"🔍  初始焦距猜测: {'开（1.0×长边）' if config['use_focal_guess'] else '关'}")
         self._log(f"🔁  回环检测:  {'开' if config['enable_loop'] else '关'}")
@@ -1908,7 +2007,7 @@ class MainWindow(QMainWindow):
                 payload.get("loop_closures"),
                 payload.get("frame_status"),
             )
-            # 只有真正跑完/最终结果才切到重建结果页
+            # 只有最终结果才切到重建结果页
             if payload.get("switch_tab", True):
                 self._switch_tab(2)
         except Exception as e:
@@ -2058,10 +2157,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-# ---------------------------------------------------------------------------
-# 入口
-# ---------------------------------------------------------------------------
-
+# ---- 入口 ----
 def main():
     setup_logging()
     set_affinity_to_all_cores()

@@ -3,3 +3,10 @@ __pycache__/
 sfm_output/
 *.mp4
 *.code-workspace
+
+# 压测产物（日志和 *_out/metrics.json 需要留档时再单独加回）
+_sfm_bench/
+
+# Cython 中间产物。发布包只保留预编译的 sfm_accel.pyd，它是要跟着仓库走的，
+# 所以这里不要写 *.pyd。
+sfm_accel.c

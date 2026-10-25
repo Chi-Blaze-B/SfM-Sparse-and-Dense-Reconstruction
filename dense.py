@@ -1,26 +1,4 @@
-"""
-稠密重建模块：基于相邻帧对的双目立体匹配（SGBM）+ 多对融合。
-
-输入：SfM 输出的 frame_paths + 内参 + 位姿
-输出：稠密点云 PLY（带 RGB）
-
-流程：
-  1. 估计场景尺度（相机中心分布），据此设定深度范围 / 体素大小
-  2. 选帧对（关键帧相邻对优先，否则全部相邻对，均匀截断到 max_pairs）
-  3. 每对：立体校正（stereoRectify + remap）→ SGBM 视差 → 反投影 → 世界坐标
-  4. 深度范围 + 基线比例过滤
-  5. 所有对点云合并
-  6. 体素降采样 + 统计离群点过滤
-  7. 写带颜色的二进制 PLY
-
-帧对级缓存（延后写盘版）：
-  · 主循环把已算完的帧对结果累积在内存，不实时落盘。
-  · 正常完成时不写缓存（避免无谓的磁盘写入）。
-  · 仅在「用户主动中断」或「配置要求」时，一次性批量写盘。
-  · 下次启动时读 cache_dir/meta.json 校验参数指纹，一致则复用已落盘的帧对。
-
-纯 OpenCV + SciPy + NumPy，无外部 SfM/MVS 依赖。
-"""
+"""稠密重建：相邻帧对 SGBM 立体匹配 + 多对点云融合。"""
 
 import hashlib
 import json
@@ -42,29 +20,22 @@ from exporter import write_ply
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# 异常
-# ---------------------------------------------------------------------------
-
+# ---- 异常 ----
 class DenseAbortedError(RuntimeError):
-    """稠密重建被用户中断（已算帧对已落盘，可下次续跑）。"""
+    """用户中断；已算帧对已落盘，下次可续跑。"""
     pass
 
 
-# ---------------------------------------------------------------------------
-# 配置与结果
-# ---------------------------------------------------------------------------
-
-CACHE_VERSION = 2  # v2: 指纹加入内参/位姿哈希
+# ---- 配置与结果 ----
+CACHE_VERSION = 3  # v3: 加入畸变模型，视差范围按深度计算
 
 
 @dataclass
 class DenseConfig:
-    """稠密重建参数。"""
-    downscale: int = 2              # 帧降采样倍数（越大越快，精度越低）
-    max_pairs: int = 60             # 最多处理的帧对数量
-    num_disparities: int = 128      # SGBM 视差范围，必须为 16 的倍数
-    block_size: int = 5             # SGBM 块大小，奇数 3~11
+    downscale: int = 2              # 降采样倍数，越大越快、精度越低
+    max_pairs: int = 60             # 帧对数量上限
+    num_disparities: int = 128      # 视差范围，必须为 16 的倍数
+    block_size: int = 5             # 块大小，奇数 3~11
     min_baseline_ratio: float = 0.005   # 基线 / 场景尺度 下限
     max_baseline_ratio: float = 0.5     # 基线 / 场景尺度 上限
     min_depth_ratio: float = 0.02       # 最小深度 / 场景尺度
@@ -72,10 +43,10 @@ class DenseConfig:
     voxel_ratio: float = 0.005          # 体素大小 / 场景尺度
     outlier_k: int = 8                  # 统计滤波近邻数
     outlier_std: float = 2.0            # 统计滤波标准差倍数
-    max_points: int = 2_000_000         # 输出点数上限（超出则随机采样）
+    max_points: int = 2_000_000         # 点数上限，超出随机采样
     min_disparity: float = 1.0          # 视差有效下限（像素）
-    enable_cache: bool = True           # 启用帧对级缓存
-    cache_on_success: bool = False      # 正常完成时也写缓存（默认只在中断时写）
+    enable_cache: bool = True           # 帧对级缓存
+    cache_on_success: bool = False      # 正常完成也写缓存，默认只写中断
 
 
 @dataclass
@@ -91,10 +62,7 @@ class DenseResult:
     elapsed_sec: float
 
 
-# ---------------------------------------------------------------------------
-# 主入口
-# ---------------------------------------------------------------------------
-
+# ---- 主入口 ----
 def dense_reconstruct(
     frame_paths: List[str],
     intrinsics: CameraIntrinsics,
@@ -107,7 +75,7 @@ def dense_reconstruct(
     cache_dir: Optional[str] = None,
     stop_event=None,
 ) -> DenseResult:
-    """从 SfM 结果做稠密重建，输出带 RGB 的点云 PLY。"""
+    """输出带 RGB 的 PLY 点云。"""
     t_start = time.time()
     cfg = config or DenseConfig()
 
@@ -139,7 +107,7 @@ def dense_reconstruct(
     )
 
     # ---- 缓存指纹 ----
-    # 加入内参 / 位姿哈希：SfM 结果变化时自动作废稠密缓存
+    # 含内参 / 位姿哈希，SfM 结果变化时缓存自动作废
     intr_poses_hash = _intr_poses_hash(intrinsics, poses)
 
     if use_cache:
@@ -324,23 +292,20 @@ def dense_reconstruct(
     )
 
 
-# ---------------------------------------------------------------------------
-# 帧对缓存
-# ---------------------------------------------------------------------------
-
+# ---- 帧对缓存 ----
 def _pair_filename(il: int, ir: int) -> str:
     return f"pair_{int(il):04d}_{int(ir):04d}.npz"
 
 
 def _intr_poses_hash(intrinsics: CameraIntrinsics,
                      poses: List[Optional[CameraPose]]) -> str:
-    """内参 + 位姿内容哈希，用于缓存指纹。
-
-    位姿抽样到最多 30 个（保证任意长度序列的计算耗时恒定）。
-    """
+    """内参 + 位姿哈希；位姿抽样到最多 30 个，保证任意序列长度耗时恒定。"""
     h = hashlib.md5()
     K = np.asarray(intrinsics.K, dtype=np.float32)
     h.update(K.tobytes())
+    # 畸变模型直接影响稠密结果，必须进指纹
+    if intrinsics.dist is not None:
+        h.update(np.asarray(intrinsics.dist, dtype=np.float64).tobytes())
 
     n = len(poses)
     step = max(1, n // 30)
@@ -363,7 +328,7 @@ def _cache_fingerprint(
     scene_scale: float,
     intr_poses_hash: str,
 ) -> dict:
-    """生成参数指纹；任意影响输出几何的项变化都会使缓存失效。"""
+    """影响输出几何的参数变化都会使缓存失效。"""
     nd = max(16, (int(cfg.num_disparities) // 16) * 16)
     bs = int(cfg.block_size)
     if bs % 2 == 0:
@@ -394,7 +359,7 @@ def _cache_fingerprint(
 
 
 def _load_and_check_meta(meta_path: Path, expected: dict) -> bool:
-    """读 meta.json 与期望指纹比对；一致返回 True。"""
+    """指纹一致才返回 True。"""
     if not meta_path.exists():
         return False
     try:
@@ -407,7 +372,6 @@ def _load_and_check_meta(meta_path: Path, expected: dict) -> bool:
 
 
 def _clear_cache(cache_path: Path) -> None:
-    """删除缓存目录下所有 pair_*.npz 文件。"""
     removed = 0
     for f in cache_path.glob("pair_*.npz"):
         try:
@@ -420,7 +384,6 @@ def _clear_cache(cache_path: Path) -> None:
 
 
 def _load_pair_cache(path: Path) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], str]:
-    """读帧对缓存。"""
     if not path.exists():
         return None, None, "miss"
     try:
@@ -429,7 +392,7 @@ def _load_pair_cache(path: Path) -> Tuple[Optional[np.ndarray], Optional[np.ndar
             rgb = np.asarray(data["rgb"])
     except Exception as e:
         logger.debug("[dense] 读取缓存失败 %s: %s", path, e)
-        # 顺手删除损坏的缓存文件，避免下次重复失败
+        # 删除损坏缓存，避免下次重复失败
         try:
             path.unlink()
         except OSError:
@@ -448,7 +411,7 @@ def _save_pair_cache(
     xyz: Optional[np.ndarray],
     rgb: Optional[np.ndarray],
 ) -> None:
-    """写帧对缓存。失败时写空数组以标记「已尝试且失败」。"""
+    """失败时写空数组，标记「已尝试且失败」以免重算。"""
     if xyz is None or rgb is None or len(xyz) == 0:
         xyz = np.zeros((0, 3), dtype=np.float32)
         rgb = np.zeros((0, 3), dtype=np.uint8)
@@ -477,9 +440,38 @@ def _emit_progress(cb, i: int, total: int, msg: str) -> None:
             logger.debug("[dense] progress_callback 异常: %s", e)
 
 
-# ---------------------------------------------------------------------------
-# 帧对处理：立体校正 + SGBM + 反投影
-# ---------------------------------------------------------------------------
+# ---- 帧对处理 ----
+def _thin_prism_undistort_map(K: np.ndarray, params: np.ndarray,
+                              w: int, h: int) -> Tuple[np.ndarray, np.ndarray]:
+    """THIN_PRISM_FISHEYE 反向映射：针孔 → 等距鱼眼 → 径向/切向/薄棱镜 → 像素，
+    按 thin_prism.h 正向公式生成 remap 网格（OpenCV 无此模型）。"""
+    fx, fy, cx, cy = (float(params[0]), float(params[1]),
+                      float(params[2]), float(params[3]))
+    k1, k2, p1, p2, k3, k4, sx1, sy1 = (float(v) for v in params[4:12])
+
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float64),
+                         np.arange(h, dtype=np.float64))
+    u = (xs - float(K[0, 2])) / float(K[0, 0])
+    v = (ys - float(K[1, 2])) / float(K[1, 1])
+
+    theta = np.sqrt(u * u + v * v)
+    scale = np.ones_like(theta)
+    nz = theta > 1e-12
+    scale[nz] = np.arctan(theta[nz]) / theta[nz]
+    uu = u * scale
+    vv = v * scale
+
+    r2 = uu * uu + vv * vv
+    radial = k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3 + k4 * r2 ** 4
+    du = (uu * radial + 2.0 * p1 * uu * vv + p2 * (r2 + 2.0 * uu * uu)
+          + sx1 * r2)
+    dv = (vv * radial + 2.0 * p2 * uu * vv + p1 * (r2 + 2.0 * vv * vv)
+          + sy1 * r2)
+
+    map_x = (fx * (uu + du) + cx).astype(np.float32)
+    map_y = (fy * (vv + dv) + cy).astype(np.float32)
+    return map_x, map_y
+
 
 def _process_pair(
     path_l: str,
@@ -492,7 +484,7 @@ def _process_pair(
     min_depth: float,
     max_depth: float,
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """处理一对图像：立体校正 → SGBM → 反投影到世界坐标。"""
+    """单帧对：立体校正 → SGBM → 反投影到世界系。"""
     # ---- 读图 + 降采样 ----
     img_l = get_image(path_l)
     img_r = get_image(path_r)
@@ -519,6 +511,56 @@ def _process_pair(
     R_rel = pose_r.R @ pose_l.R.T
     t_rel = (pose_r.t - R_rel @ pose_l.t).reshape(3, 1)
 
+    # ---- 去畸变：SfM 位姿基于反畸变点 ----
+    dist = (None if intrinsics.dist is None
+            else np.asarray(intrinsics.dist, dtype=np.float64).ravel())
+    if dist is not None:
+        if dist.size == 12:
+            # THIN_PRISM_FISHEYE：OpenCV 无此模型，用自定义反向映射
+            p = dist.copy()
+            p[0] /= ds
+            p[1] /= ds
+            p[2] /= ds
+            p[3] /= ds
+            map_x, map_y = _thin_prism_undistort_map(K, p, w, h)
+        else:
+            map_x, map_y = cv2.initUndistortRectifyMap(
+                K, dist, None, K, (w, h), cv2.CV_32FC1)
+        img_l = cv2.remap(img_l, map_x, map_y, cv2.INTER_LINEAR)
+        img_r = cv2.remap(img_r, map_x, map_y, cv2.INTER_LINEAR)
+
+    # ---- 基线滚转 ----
+    # 相对位移以竖直为主时（如 ETH3D relief 的俯仰拍摄），stereoRectify 不会把
+    # 基线转平，SGBM 水平视差搜索失效；故先绕光轴转 90°，位姿与内参同转。
+    rolled = False
+    if abs(float(t_rel[1, 0])) > abs(float(t_rel[0, 0])):
+        rolled = True
+        fx0, fy0, cx0, cy0 = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        w_old, h_old = w, h
+        if float(t_rel[1, 0]) > 0:
+            # 使 t_x' = -t_y < 0（右相机在右，正视差）：Rz(+90)，顺时针
+            R3 = np.array([[0.0, -1.0, 0.0],
+                           [1.0, 0.0, 0.0],
+                           [0.0, 0.0, 1.0]])
+            img_l = cv2.rotate(img_l, cv2.ROTATE_90_CLOCKWISE)
+            img_r = cv2.rotate(img_r, cv2.ROTATE_90_CLOCKWISE)
+            K = np.array([[fy0, 0.0, (h_old - 1) - cy0],
+                          [0.0, fx0, cx0],
+                          [0.0, 0.0, 1.0]], dtype=np.float64)
+        else:
+            # 使 t_x' = t_y < 0：Rz(-90)，逆时针
+            R3 = np.array([[0.0, 1.0, 0.0],
+                           [-1.0, 0.0, 0.0],
+                           [0.0, 0.0, 1.0]])
+            img_l = cv2.rotate(img_l, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            img_r = cv2.rotate(img_r, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            K = np.array([[fy0, 0.0, cy0],
+                          [0.0, fx0, (w_old - 1) - cx0],
+                          [0.0, 0.0, 1.0]], dtype=np.float64)
+        h, w = img_l.shape[:2]
+        R_rel = R3 @ R_rel @ R3.T
+        t_rel = (R3 @ t_rel.reshape(3)).reshape(3, 1)
+
     # ---- 立体校正 ----
     R1_r, R2_r, P1, P2, Q, _, _ = cv2.stereoRectify(
         K, None, K, None, (w, h), R_rel, t_rel,
@@ -532,13 +574,26 @@ def _process_pair(
     rect_l = cv2.remap(img_l, map1x, map1y, cv2.INTER_LINEAR)
     rect_r = cv2.remap(img_r, map2x, map2y, cv2.INTER_LINEAR)
 
-    # 直接对校正图做灰度，不再多算一遍原始灰度
+    # 直接对校正图取灰度，省一遍原图转换
     gray_l_r = cv2.cvtColor(rect_l, cv2.COLOR_BGR2GRAY)
     gray_r_r = cv2.cvtColor(rect_r, cv2.COLOR_BGR2GRAY)
 
+    # ---- 视差范围：按深度换算，不写死 0/128 ----
+    # 校正后 d = fx_rect * baseline / Z
+    fx_rect = float(P1[0, 0])
+    baseline = abs(float(P2[0, 3]) / fx_rect) if abs(fx_rect) > 1e-9 else 0.0
+    if baseline > 1e-9:
+        d_far = fx_rect * baseline / max(max_depth, 1e-9)
+        d_near = fx_rect * baseline / max(min_depth, 1e-9)
+        min_disp = int(max(0, np.floor(d_far) - 2))
+        need = int(np.ceil(d_near - min_disp))
+        num_disp = int(min(256, max(16, np.ceil(max(need, 16) / 16.0) * 16)))
+    else:
+        min_disp, num_disp = 0, int(cfg.num_disparities)
+
     # ---- SGBM 视差 ----
     disp = _compute_disparity(
-        gray_l_r, gray_r_r, cfg.num_disparities, cfg.block_size,
+        gray_l_r, gray_r_r, num_disp, cfg.block_size, min_disp,
     )
     if disp is None:
         return None
@@ -549,22 +604,24 @@ def _process_pair(
 
     valid = (
         np.isfinite(pts3d_rect).all(axis=2)
-        & (disp >= cfg.min_disparity)
+        & (disp >= max(float(cfg.min_disparity), float(min_disp)))
         & (Z_rect > min_depth)
         & (Z_rect < max_depth)
     )
     if not np.any(valid):
         return None
 
-    # ---- 校正左系 → 原左系 → 世界系（只对有效像素做变换）----
+    # ---- 校正左系 → 原左系 → 世界系（仅有效像素）----
     ys, xs = np.nonzero(valid)
     pts_valid = pts3d_rect[ys, xs].astype(np.float64)
 
     R_L = np.asarray(pose_l.R, dtype=np.float64)
     t_L = pose_l.t.reshape(3).astype(np.float64)
 
-    pts_cam_l = pts_valid @ R1_r              # 校正系 → 原左系
-    pts_world = (pts_cam_l - t_L) @ R_L       # 原左系 → 世界系
+    pts_cam_l = pts_valid @ R1_r              # 校正系 → 旋转后的左相机系
+    if rolled:
+        pts_cam_l = pts_cam_l @ R3            # 旋转系 → 原左相机系
+    pts_world = (pts_cam_l - t_L) @ R_L       # 原左相机系 → 世界系
     xyz = pts_world.astype(np.float32)
 
     rgb = rect_l[ys, xs][:, ::-1].astype(np.uint8)   # BGR → RGB
@@ -572,21 +629,23 @@ def _process_pair(
     return xyz, rgb
 
 
-# SGBM 实例缓存：相同 (num_disparities, block_size) 复用
-_SGBM_CACHE: Dict[Tuple[int, int], "cv2.StereoSGBM"] = {}
+# SGBM 实例缓存：参数相同则复用
+_SGBM_CACHE: Dict[Tuple[int, int, int], "cv2.StereoSGBM"] = {}
 
 
-def _get_sgbm(num_disparities: int, block_size: int) -> "cv2.StereoSGBM":
+def _get_sgbm(num_disparities: int, block_size: int,
+              min_disparity: int = 0) -> "cv2.StereoSGBM":
     nd = max(16, (int(num_disparities) // 16) * 16)
+    md = int(max(0, min_disparity))
     bs = int(block_size)
     if bs % 2 == 0:
         bs += 1
     bs = max(3, min(bs, 21))
-    key = (nd, bs)
+    key = (nd, md, bs)
     sgbm = _SGBM_CACHE.get(key)
     if sgbm is None:
         sgbm = cv2.StereoSGBM_create(
-            minDisparity=0,
+            minDisparity=md,
             numDisparities=nd,
             blockSize=bs,
             P1=8 * bs * bs,
@@ -607,10 +666,11 @@ def _compute_disparity(
     gray_r: np.ndarray,
     num_disparities: int,
     block_size: int,
+    min_disparity: int = 0,
 ) -> Optional[np.ndarray]:
-    """SGBM 视差计算，返回 float32（像素单位）。"""
+    """返回 float32 像素视差，含 minDisparity 偏移。"""
     try:
-        stereo = _get_sgbm(num_disparities, block_size)
+        stereo = _get_sgbm(num_disparities, block_size, min_disparity)
         disp16 = stereo.compute(gray_l, gray_r)
     except cv2.error as e:
         logger.warning("[dense] SGBM 失败: %s", e)
@@ -620,12 +680,9 @@ def _compute_disparity(
     return disp
 
 
-# ---------------------------------------------------------------------------
-# 点云后处理
-# ---------------------------------------------------------------------------
-
+# ---- 点云后处理 ----
 def _estimate_scene_scale(poses: List[Optional[CameraPose]]) -> float:
-    """用相机中心分布的包围盒对角线估计场景尺度。"""
+    """包围盒对角线；不足 2 个位姿时返回 1.0。"""
     centers = np.array([p.center for p in poses if p is not None],
                        dtype=np.float64)
     if len(centers) < 2:
@@ -639,7 +696,7 @@ def _select_pairs(
     n_frames: int,
     max_pairs: int,
 ) -> List[Tuple[int, int]]:
-    """选帧对：优先关键帧相邻对，否则全部相邻对，均匀截断。"""
+    """优先关键帧相邻对，否则全部相邻对；超量均匀截断。"""
     if keyframes and len(keyframes) >= 2:
         kf = sorted(set(int(k) for k in keyframes if 0 <= k < n_frames))
         pairs = [(kf[i], kf[i + 1]) for i in range(len(kf) - 1)]
@@ -658,7 +715,7 @@ def _voxel_downsample(
     rgb: np.ndarray,
     voxel_size: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """体素降采样：每个体素内取 xyz / rgb 均值。"""
+    """每个体素取 xyz / rgb 均值。"""
     if len(xyz) == 0:
         return xyz, rgb
 
@@ -688,7 +745,6 @@ def _statistical_outlier_filter(
     k: int,
     std_ratio: float,
 ) -> np.ndarray:
-    """统计离群点过滤：剔除近邻平均距离过大的点。"""
     if len(xyz) < k + 1:
         return np.ones(len(xyz), dtype=bool)
     try:

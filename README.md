@@ -39,7 +39,7 @@
   </a>
 </p>
 
-基于 Python 的视频转 SfM 稀疏 / 稠密点云工作流。输入一段视频，输出稀疏点云或稀疏 + 稠密点云，可用 MeshLab、CloudCompare 等工具浏览。
+基于 Python 的视频 / 图片集转 SfM 稀疏 / 稠密点云工作流。输入一段视频或一个图片集目录，输出稀疏点云或稀疏 + 稠密点云，可用 MeshLab、CloudCompare 等工具浏览。
 
 **核心为 OpenCV + SciPy + NumPy，回环词袋使用 scikit-learn MiniBatchKMeans；无 PyTorch、无 CUDA、无外部 SfM / MVS 二进制**。抽帧、位姿估计、三角化、BA、回环、PGO、稠密立体匹配全部内置。
 
@@ -84,6 +84,23 @@ git clone https://github.com/Chi-Blaze-B/SfM-Sparse-and-Dense-Reconstruction
 | matplotlib | 相机轨迹 / 点云可视化（Agg 后端，仅 GUI 需要） |
 | psutil | CPU 亲和性设置、硬件探测 |
 
+### 预编译加速模块（可选，仓库自带）
+
+`sfm_accel.pyd` 是 Cython 写的热点内核（批量投影、描述子指派、三角化角检查、地图点合并）。
+**已随仓库提供预编译版本，不需要 Cython，也不需要编译器。** 它是自包含的，
+只依赖 Windows 自带的 UCRT，不附带任何 MinGW 运行时 DLL。
+
+| 项目 | 说明 |
+|---|---|
+| 适用环境 | CPython **3.11** / **win-amd64** |
+| 环境不匹配时 | 导入失败 → `poses.py` 自动回退到纯 Python 实现，**结果完全一致**（128 张压测慢约 5%） |
+| 怎么确认 | 启动日志里有 `[加速] Cython 内核: 已启用 (sfm_accel)` 或 `未启用…` |
+| 强制关掉 | `set SFM_ACCEL=0` |
+| 自行重编 | `pip install cython && python build_accel.py`（需 gcc / MinGW-w64） |
+
+> 加速只针对数组与对象循环那一层。BA（pyceres）和特征匹配（OpenCV）本来就在 C++ 里，
+> 换不换这个模块都不影响它们的耗时。
+
 ---
 
 ## 🚀 使用方式
@@ -96,18 +113,28 @@ python cli.py --video input.mp4 --output-dir ./sfm_output
 
 # 稀疏 + 稠密全程
 python cli.py --video input.mp4 --output-dir ./sfm_output --mode dense
+
+# 直接指定图片集（与 --video 二选一）
+python cli.py --image-dir ./images --output-dir ./sfm_output
+
+# 图片集 + 标定（例如 ETH3D 的 THIN_PRISM_FISHEYE）
+python cli.py --image-dir scene/images/dslr_images \
+    --camera-matrix K.npy --dist-coeffs dist.npy
 ```
 
 | 参数 | 说明 | 默认值 |
 |---|---|---|
-| `--video` | 输入视频路径 | 必填 |
+| `--video` | 输入视频路径（与 `--image-dir` 二选一） | 必填其一 |
+| `--image-dir` | 输入图片集目录（与 `--video` 二选一） | 必填其一 |
 | `--output-dir` | 输出目录（点云 / 位姿 / 内参） | `./sfm_output` |
 | `--workdir` | 工作目录 | `./workdir` |
 | `--mode` | `sparse` / `dense` | `sparse` |
-| `--sampling-mode` | `uniform` / `smart` / `two-stage` | `uniform` |
-| `--fps` | 采样帧率 | `15.0` |
-| `--scale` | 画面缩放（0~1） | `0.5` |
-| `--min-frames` / `--max-frames` | 最少 / 最多提取帧数 | `30` / `200` |
+| `--sampling-mode` | `uniform` / `smart` / `two-stage`（仅视频） | `uniform` |
+| `--fps` | 采样帧率（仅视频） | `15.0` |
+| `--scale` | 画面缩放（0~1） | 视频 `0.5`，图片集 `1.0` |
+| `--min-frames` / `--max-frames` | 最少 / 最多帧数（图片集：最多图片数，0=全部） | 视频 `30` / `200`，图片集 `2` / `0` |
+| `--camera-matrix` | 3×3 内参矩阵 `.npy`（可选） | `None` |
+| `--dist-coeffs` | 畸变系数 `.npy`；4/5/8 值走 OpenCV，12 值走 COLMAP THIN_PRISM_FISHEYE | `None` |
 | `--feature-type` | `orb` / `sift` / `rootsift` | `orb` |
 | `--use-focal-guess` | 以 1.0×长边作初始像素焦距（约 53° FOV） | `False` |
 | `--no-loop` | 关闭回环检测（短序列 / 纯前向拍摄可关） | 不传时开启 |
@@ -118,6 +145,16 @@ python cli.py --video input.mp4 --output-dir ./sfm_output --mode dense
 | `--dense-voxel-ratio` | 稠密体素大小 / 场景尺度 | `0.005` |
 | `--reuse-dir` | 复用工作目录的中间产物，跳过已完成步骤 | `None` |
 | `--frame-cache-mb` | 帧图像内存缓存上限（MiB）；0 表示禁用 | `1500` |
+
+图片集模式的约定：
+
+- 目录内的图片按**文件名自然排序**（`DSC_2` 排在 `DSC_10` 之前）；
+- 顶层没有图片时会**自动递归**查找子目录，因此可以直接指向
+  ETH3D 的 `<scene>` 或 `<scene>/images`；
+- `--scale 1.0`（默认）**直接引用原图**，不复制、不解码，不会占双份磁盘；
+  `--scale < 1` 时才解码缩放并写入 `workdir/frames/frame_XXXXX.png`；
+- 图片集模式下 `--sampling-mode` / `--fps` / `--min-frames` 不生效；
+  `--max-frames > 0` 表示按自然顺序**均匀抽取**该数量的图片。
 
 ```bash
 # 智能采样 + SIFT
@@ -138,14 +175,17 @@ python cli.py --video input.mp4 --feature-type rootsift --enable-global-matching
 # 短序列 / 纯前向拍摄：关闭回环与 PGO 加速
 python cli.py --video input.mp4 --no-loop --no-pgo
 
+# 图片集：只取 50 张、缩放到一半、跑稠密
+python cli.py --image-dir ./images --scale 0.5 --max-frames 50 --mode dense
+
 # 复用上次的帧 / 位姿缓存，只重跑导出
 python cli.py --video input.mp4 --reuse-dir ./workdir
 ```
 
 > `--reuse-dir` 指向的工作目录必须存在，CLI 会读取
 > `frame_paths.txt` / `intrinsics.npy` / `poses.npy` / `sparse_points.npy`
-> 以及可选的 `sfm_meta.json`；若抽帧参数与 `frame_meta.json` 不一致，
-> 会自动重新抽帧并作废下游缓存。
+> 以及可选的 `sfm_meta.json`；若输入或抽帧参数与 `frame_meta.json` 不一致，
+> 会自动重新准备帧并作废下游缓存。
 
 ### 2. 图形界面（GUI）
 
@@ -153,9 +193,9 @@ python cli.py --video input.mp4 --reuse-dir ./workdir
 python gui.py
 ```
 
-- 视频、输出目录、工作目录选择
+- 视频 / 图片集输入切换（视频文件或图片集目录）、输出目录、工作目录选择
 - 运行模式：稀疏重建 / 稀疏 + 稠密
-- 采样策略、帧率、缩放、帧数范围
+- 采样策略、帧率、缩放、帧数范围（图片集模式下自动隐藏仅视频有效的选项，最多图片数 0 表示全部）
 - 特征描述子（ORB / SIFT / RootSIFT）、初始焦距猜测、回环 / PGO / 全局匹配开关
 - 稠密参数（降采样倍数、最多帧对、体素比例），仅在 dense 模式可见
 - 帧图像内存缓存上限（MiB，0 禁用）
@@ -175,19 +215,20 @@ python gui.py
 
 | 模块 | 功能 |
 |---|---|
-| `frames.py` | 视频抽帧，uniform / smart / two-stage 采样；清晰度 + 光流门控，时间覆盖兜底与分层加权 |
+| `frames.py` | 视频抽帧（uniform / smart / two-stage 采样；清晰度 + 光流门控，时间覆盖兜底与分层加权）与图片集导入（自然排序、递归查找、按需缩放） |
 | `poses.py` | 增量式 SfM（ORB / SIFT / RootSIFT），最佳初始帧对 + 退化检测、相邻帧跟踪 + 局部地图 PnP、F/H 几何验证、多视图 DLT 重三角化、点合并、EM 加权 BA（fx / fy；主点内部可选）、MiniBatchKMeans BoW 回环 + 时间一致性、PGO（加权 Cauchy）、PGO 后全局 BA |
 | `dense.py` | 稠密重建：SGBM 立体匹配 + 深度 / 基线过滤 + 体素降采样 + 统计离群点过滤；帧对级缓存续跑 |
 | `exporter.py` | 二进制 PLY、`cameras.txt`、`intrinsics.json` 导出 |
 | `frame_meta.py` | `frame_meta.json` 读写、抽帧参数校验、缓存复用判断与下游作废 |
 | `frame_cache.py` | 进程内线程安全 LRU 帧图像内存缓存；支持预加载、命中率统计，CLI / GUI 共用 |
 | `gui.py` / `cli.py` | PySide6 暗色 GUI 与命令行入口，sparse / dense 双模式 |
+| `sfm_accel.pyx` / `build_accel.py` | Cython 加速内核（批量投影、描述子指派、三角化角检查、地图点合并）与构建脚本；仓库自带 CPython 3.11 / win-amd64 的预编译 `sfm_accel.pyd`，导入失败时 `poses.py` 自动回退纯 Python，结果完全一致 |
 
 **实现要点**
 
 - **初始化**：在起始窗口内枚举所有候选帧对，按内点数打分选出最佳初始 pair；用 E 矩阵恢复相对位姿，并做正深度比例 + 中位视差角退化检测，失败可自动换下一对。
 - **匹配与验证**：ORB 用 Hamming + ratio test，SIFT / RootSIFT 用 L2；描述子匹配采用互最近邻 + 双向 ratio；关键决策（回环、局部 PnP 候选）用 F/H RANSAC 做几何验证，剔除误匹配。
-- **BA**：SciPy 稀疏 TRF + Huber/Cauchy 损失；EM 软内点加权作为最后精修；默认联合优化 `fx` / `fy`，主点优化为内部可选且当前入口默认关闭；焦距漂移有步长上限，异常时自动回滚。
+- **BA**：pyceres（自定义 Python CostFunction，解析雅可比）+ Huber/Cauchy 损失；EM 软内点加权作为最后精修；默认联合优化 `fx` / `fy`，主点优化为内部可选且当前入口默认关闭；焦距漂移有步长上限，异常时自动回滚。
 - **回环**：MiniBatchKMeans 训练视觉词 + TF-IDF 加权直方图 + 余弦相似度检索；候选通过 F/H RANSAC、PnP RANSAC 与序列一致性验证。
 - **地图管理**：周期性多视图 DLT 重三角化；基于描述子 + 3D 位置的点合并；先剔除坏观测再删点，`feat_map` 同步更新。
 - **PGO**：顺序边与回环边带不同权重（回环边权重随共视计数调整），Cauchy 核；PGO 之后再跑一次全局 BA，提升重投影一致性。
@@ -195,6 +236,7 @@ python gui.py
 - **抽帧**：拉普拉斯方差清晰度 + Farneback / LK 光流，门控阈值随视频自适应，分层选择段内按 清晰度 × 光流 加权。
 - **稠密**：`stereoRectify` + `remap` 校正，`reprojectImageTo3D` 反投影，深度 / 基线比例过滤；体素降采样用线性索引 + `np.bincount` 加权，离群点过滤用 `cKDTree` 近邻平均距离。
 - **CPU 亲和性**：启动时自动绑定所有逻辑核心。
+- **性能**：热点循环已向量化或 Cython 化 —— 补 track 改成「一次批量投影 + 一次批量 kd-tree 查询 + C 里逐点指派」，点合并的逐对判据进 Cython，BoW 量化用 `‖d‖²+‖w‖²−2d·w` 的单次 BLAS 乘代替 GB 级广播。south-building 128 张 @1600 从 1215 s 降到 **249 s**（注册率 / 精度不变）。
 
 ---
 
@@ -337,6 +379,10 @@ python cli.py --video input.mp4 --reuse-dir ./workdir
 ## 📄 许可证
 
 Apache-2.0，欢迎自由使用和修改。
+
+仓库内的预编译二进制 `sfm_accel.pyd` 由同目录的 `sfm_accel.pyx` 编译产生，适用同样的
+Apache-2.0 许可。它只依赖 Windows 自带的 UCRT，不附带 GCC 的 GPL 运行时库
+（`libgomp` / `libwinpthread` 均未使用）。
 
 ## 🙏 致谢
 

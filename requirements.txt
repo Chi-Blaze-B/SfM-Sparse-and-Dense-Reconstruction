@@ -5,12 +5,26 @@
 #   · OpenCV 使用 headless 版本（避免与 PySide6 的 Qt 冲突）。
 #   · 不含 PyTorch：SfM 纯 CPU 即可运行，无需 GPU。
 #   · 回环词袋使用 scikit-learn MiniBatchKMeans，因此 scikit-learn 为必需依赖。
-#   · 建议 Python 3.11。
+#   · 建议 Python 3.11（64 位 Windows）。
+#
+# 关于 Cython 加速模块
+#   仓库里已经带了预编译的 `sfm_accel.pyd`，**不需要装 Cython、也不需要编译器**，
+#   解压即可用。它是自包含的，不依赖任何额外的 MinGW 运行时 DLL。
+#   二进制对应 CPython 3.11 / win-amd64；如果解释器版本或平台不匹配，导入会失败，
+#   `poses.py` 会自动回退到纯 Python 实现 —— 结果完全一致，只是慢约 5%。
+#   `SFM_ACCEL=0` 可以强制走纯 Python。
+#
+#   需要重新编译时（换 Python 版本 / 换平台 / 改内核）：
+#       pip install cython
+#       python build_accel.py        # 需要 gcc（维护者用的是 MinGW-w64）
+#   构建脚本默认不带 OpenMP，因此产物不依赖 libgomp-1.dll / libwinpthread-1.dll。
 
 numpy>=1.24.0
 scipy>=1.10.0
 opencv-python-headless>=4.8.0
 scikit-learn>=1.3.0
+joblib>=1.3.0
+pyceres>=2.6.0
 PySide6>=6.5.0
 matplotlib>=3.7.0
 psutil>=5.9.0

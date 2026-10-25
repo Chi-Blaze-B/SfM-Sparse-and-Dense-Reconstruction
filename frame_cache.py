@@ -1,6 +1,4 @@
-"""
-进程内帧图像内存缓存。
-"""
+"""进程内帧图像内存缓存。"""
 
 from __future__ import annotations
 
@@ -54,13 +52,9 @@ class FrameCache:
 
     # ---- 公共 ----
     def get(self, path: str) -> Optional[np.ndarray]:
-        """取图像；命中返回只读 ndarray，未命中读盘并缓存。
-
-        读盘失败返回 None（与 cv2.imread 行为一致）。
-        """
+        """命中返回只读 ndarray；读盘失败返回 None（同 cv2.imread）。"""
         if not path:
             return None
-        # 禁用缓存：直接读盘
         if self.max_bytes <= 0:
             return cv2.imread(path, cv2.IMREAD_COLOR)
 
@@ -95,7 +89,7 @@ class FrameCache:
 
     def preload(self, paths: Iterable[str],
                 max_items: Optional[int] = None) -> int:
-        """顺序预加载；占用超过上限 90% 时提前停止。返回加载张数。"""
+        """占满 90% 预算即停止，避免把缓存挤爆。"""
         if self.max_bytes <= 0:
             return 0
         items = list(paths)
@@ -140,7 +134,7 @@ class FrameCache:
             }
 
 
-# ---------------- 进程级默认缓存 ----------------
+# ---- 进程级默认缓存 ----
 _DEFAULT_CACHE: Optional[FrameCache] = None
 _DEFAULT_LOCK = threading.Lock()
 
@@ -148,11 +142,7 @@ _DEFAULT_LOCK = threading.Lock()
 def configure(max_bytes: Optional[int] = None,
               preload: Optional[Iterable[str]] = None,
               preload_limit: Optional[int] = None) -> FrameCache:
-    """配置全局缓存；可选顺带预加载一批帧。
-
-    · 传 max_bytes=None：保留当前缓存实例（若不存在则创建默认实例）。
-    · 传 max_bytes<=0：禁用缓存。
-    """
+    """max_bytes=None 保留现有实例；<=0 表示禁用缓存。"""
     global _DEFAULT_CACHE
     with _DEFAULT_LOCK:
         if _DEFAULT_CACHE is None or max_bytes is not None:
@@ -175,7 +165,6 @@ def get_default_cache() -> FrameCache:
 
 
 def get_image(path: str) -> Optional[np.ndarray]:
-    """便捷入口：get_default_cache().get(path)。"""
     return get_default_cache().get(path)
 
 

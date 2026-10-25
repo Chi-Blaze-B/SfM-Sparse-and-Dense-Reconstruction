@@ -1,13 +1,8 @@
-"""
-从视频中提取帧，支持三种策略：
-
-- 均匀采样（默认）：等间隔抽取目标数量的帧。
-- 单阶段智能采样：清晰度 + 帧间变化门控，段内按清晰度×光流加权。
-- 两阶段智能采样：单阶段门控 + 粗位姿视差加权。
-"""
+"""从视频或图片集抽帧，支持均匀采样与两阶段智能采样。"""
 
 import logging
 import os
+import re
 import tempfile
 import shutil
 from typing import List, Optional, Tuple
@@ -17,8 +12,13 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# 图片集输入支持的扩展名
+IMAGE_EXTS = {
+    ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".ppm", ".pgm",
+}
 
-# ---------- 配置 ----------
+
+# ---- 配置 ----
 DEFAULT_OPTICAL_FLOW_METHOD = "farneback"  # 或 "lk"
 LK_WINDOW_SIZE = (15, 15)
 LK_MAX_LEVEL = 3
@@ -33,32 +33,32 @@ FARNEBACK_PARAMS = {
     "flags": 0,
 }
 
-# 打分阶段最大采样帧数，控制耗时上界
+# 打分采样上限，控制耗时
 MAX_SCORE_SAMPLES = 100
 
-# 打分时缩放后的最大边长，保证不同视频间分数尺度可比
+# 打分缩放后的最大边长，保证跨视频分数可比
 SCORE_MAX_SIDE = 480
 
-# 门控分位数：剔除分数最低的对应比例
+# 门控分位数：剔除分数最低的该比例帧
 SHARPNESS_QUANTILE = 0.05
 FLOW_QUANTILE = 0.05
 
-# 门控相对下限：阈值不低于中位数的对应比例。
+# 门控相对下限：阈值不低于中位数的该比例
 SHARPNESS_MEDIAN_RATIO = 0.08
 FLOW_MEDIAN_RATIO = 0.08
 
-# 时间覆盖兜底：每个时间分箱至少保留 min_per_bin 个通过帧
+# 时间覆盖兜底：每箱至少保留 min_per_bin 个通过帧
 TIME_COVERAGE_BINS = 20
 TIME_COVERAGE_MIN_PER_BIN = 12
 
-# 最终选择的时间分层段数。各段均分名额，避免低权重段被跳过。
+# 最终选择的分层段数，各段均分名额，避免低权重段被跳过
 SELECT_BINS = 20
 
 # 两阶段粗提取帧数
 COARSE_FRAMES = 40
 
 
-# ---------- 公共入口 ----------
+# ---- 公共入口 ----
 def extract_frames(
     video_path: str,
     output_dir: str,
@@ -73,7 +73,6 @@ def extract_frames(
     optical_flow_method: str = DEFAULT_OPTICAL_FLOW_METHOD,
     feature_type: str = "orb",
 ) -> List[str]:
-    """从视频提取帧。"""
     strategy = "two_stage" if two_stage else ("smart" if smart_sampling else "uniform")
     logger.info(
         "extract_frames 开始: strategy=%s, video=%s, output_dir=%s, "
@@ -83,7 +82,7 @@ def extract_frames(
         optical_flow_method, feature_type,
     )
 
-    # 清理旧帧，避免残留影响后续判断
+    # 避免旧帧残留影响后续判断
     _clear_old_frames(output_dir)
 
     if two_stage:
@@ -110,7 +109,6 @@ def extract_frames(
 
 
 def _clear_old_frames(output_dir: str) -> None:
-    """清理输出目录下的旧帧文件。"""
     if not os.path.isdir(output_dir):
         return
     n = 0
@@ -125,7 +123,112 @@ def _clear_old_frames(output_dir: str) -> None:
         logger.info("已清理 %d 个旧帧文件", n)
 
 
-# ---------- 均匀采样 ----------
+# ---- 图片集输入 ----
+def _natural_key(path: str):
+    parts = re.split(r"(\d+)", os.path.normcase(path))
+    return [(1, int(p)) if p.isdigit() else (0, p) for p in parts]
+
+
+def list_images(image_dir: str, *, recursive: bool = True) -> List[str]:
+    """顶层无图片时递归查找，如 ETH3D 的 <scene>/images/dslr_images。"""
+    root = os.path.abspath(image_dir)
+    if not os.path.isdir(root):
+        raise NotADirectoryError(f"图片目录不存在: {image_dir}")
+
+    def _scan(d: str, recurse: bool) -> List[str]:
+        out: List[str] = []
+        if recurse:
+            for dirpath, dirnames, filenames in os.walk(d):
+                dirnames.sort()
+                for fn in filenames:
+                    if os.path.splitext(fn)[1].lower() in IMAGE_EXTS:
+                        out.append(os.path.join(dirpath, fn))
+        else:
+            try:
+                names = os.listdir(d)
+            except OSError as e:
+                raise NotADirectoryError(f"无法读取图片目录: {image_dir}") from e
+            for fn in names:
+                p = os.path.join(d, fn)
+                if os.path.isfile(p) and os.path.splitext(fn)[1].lower() in IMAGE_EXTS:
+                    out.append(p)
+        return out
+
+    files = _scan(root, False)
+    if files:
+        files.sort(key=_natural_key)
+        return files
+
+    if not recursive:
+        return []
+    logger.info("顶层未找到图片，递归扫描子目录: %s", root)
+    files = _scan(root, True)
+    files.sort(key=lambda p: _natural_key(os.path.relpath(p, root)))
+    return files
+
+
+def import_images(
+    image_dir: str,
+    output_dir: str,
+    *,
+    scale: float = 1.0,
+    max_frames: int = 0,
+    recursive: bool = True,
+) -> List[str]:
+    """scale=1 时直接引用原图，避免大图片集占双份磁盘。"""
+    all_files = list_images(image_dir, recursive=recursive)
+    if not all_files:
+        raise FileNotFoundError(f"图片目录中没有可用图片: {image_dir}")
+
+    files = all_files
+    if max_frames and max_frames > 0 and len(files) > max_frames:
+        idx = np.unique(np.linspace(0, len(files) - 1, max_frames, dtype=int))
+        files = [files[i] for i in idx]
+        logger.info("图片集共 %d 张，按 max_frames 均匀抽取 %d 张",
+                    len(all_files), len(files))
+
+    if scale >= 0.999:
+        logger.info("图片集共 %d 张，直接引用原图（scale=1.0，不复制）",
+                    len(files))
+        return files
+
+    os.makedirs(output_dir, exist_ok=True)
+    _clear_old_frames(output_dir)
+
+    paths: List[str] = []
+    skipped = 0
+    out_size = None
+    for i, src in enumerate(files):
+        img = cv2.imread(src, cv2.IMREAD_COLOR)
+        if img is None:
+            skipped += 1
+            logger.warning("跳过无法解码的图片: %s", src)
+            continue
+        h, w = img.shape[:2]
+        nw, nh = _compute_resized_size(w, h, scale, log=False)
+        if (nw, nh) != (w, h):
+            img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+        out_path = os.path.join(output_dir, f"frame_{i:05d}.png")
+        if not cv2.imwrite(out_path, img):
+            skipped += 1
+            logger.warning("写入缩放帧失败: %s", out_path)
+            continue
+        if out_size is None:
+            out_size = (nw, nh)
+            logger.info("缩放尺寸: %dx%d (scale=%.2f) -> %dx%d",
+                        w, h, scale, nw, nh)
+        paths.append(out_path)
+
+    logger.info(
+        "图片集导入完成: %d 张 → %s（缩放 %.2f，输出 %s，跳过 %d 张）",
+        len(paths), output_dir, scale,
+        f"{out_size[0]}x{out_size[1]}" if out_size else "-", skipped,
+    )
+    return paths
+
+
+
+# ---- 均匀采样 ----
 def _uniform_extract(
     video_path: str,
     output_dir: str,
@@ -134,7 +237,6 @@ def _uniform_extract(
     min_frames: int,
     max_frames: int,
 ) -> List[str]:
-    """均匀采样：在时间轴上等间隔抽取目标数量的帧。"""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logger.error("无法打开视频: %s", video_path)
@@ -167,7 +269,7 @@ def _uniform_extract(
         cap.release()
 
 
-# ---------- 单阶段智能采样 ----------
+# ---- 单阶段智能采样 ----
 def _smart_extract(
     video_path: str,
     output_dir: str,
@@ -177,7 +279,6 @@ def _smart_extract(
     max_frames: int,
     flow_method: str,
 ) -> List[str]:
-    """单阶段智能采样：清晰度 + 光流门控，通过门控的帧按时间分层选择。"""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logger.error("无法打开视频: %s", video_path)
@@ -214,16 +315,7 @@ def _smart_extract_from_cap(
     h: int,
     flow_method: str,
 ) -> List[str]:
-    """在已打开的 cap 上执行单阶段智能采样。
-
-    步骤：
-    1. 在约 MAX_SCORE_SAMPLES 个采样帧上计算清晰度和光流；
-    2. 插值扩展到每一帧；
-    3. 门控：剔除清晰度或光流低于阈值的帧；
-    4. 时间覆盖兜底：每个时间分箱至少保留少量帧；
-    5. 时间分层选择：每段均分名额，段内按 清晰度×光流 加权选择；
-    6. 通过帧数不足时回退到均匀采样。
-    """
+    """打分采样、门控、时间覆盖兜底后分层加权选择；通过帧不足时回退均匀采样。"""
     sample_indices = _make_sample_indices(total)
     logger.info("打分采样点: %d 个（上限 %d），首=%d, 末=%d",
                 len(sample_indices), MAX_SCORE_SAMPLES,
@@ -255,7 +347,7 @@ def _smart_extract_from_cap(
         indices = np.linspace(0, total - 1, num_frames, dtype=int)
     else:
         target = min(num_frames, n_valid)
-        # 用 清晰度 × 光流 做段内加权
+        # 段内按 清晰度 × 光流 加权
         score = sharp_full * flow_full
         weights = score * valid.astype(np.float64)
         if weights.sum() <= 1e-9:
@@ -270,7 +362,7 @@ def _smart_extract_from_cap(
     return paths
 
 
-# ---------- 两阶段智能采样 ----------
+# ---- 两阶段智能采样 ----
 def _two_stage_extract(
     video_path: str,
     output_dir: str,
@@ -281,8 +373,7 @@ def _two_stage_extract(
     flow_method: str,
     feature_type: str,
 ) -> List[str]:
-    """两阶段智能采样。"""
-    from poses import estimate_poses  # 延迟导入
+    from poses import estimate_poses  # 延迟导入，避免循环依赖
 
     logger.info("两阶段智能采样: 开始, video=%s, feature=%s, flow=%s",
                 video_path, feature_type, flow_method)
@@ -309,7 +400,7 @@ def _two_stage_extract(
     logger.info("粗提取临时目录: %s", coarse_dir)
 
     try:
-        # ---------- 阶段 1：粗提取 + 粗位姿 ----------
+        # ---- 阶段 1：粗提取 ----
         coarse_raw = np.linspace(0, total - 1, min(COARSE_FRAMES, total), dtype=int)
         coarse_paths, coarse_indices = _extract_indices(cap, coarse_raw, coarse_dir, w, h)
         logger.info("阶段 1: 粗提取 %d 帧（计划 %d 帧）",
@@ -324,12 +415,12 @@ def _two_stage_extract(
             )
 
         try:
-            # 粗位姿只为视差加权用，禁掉回环/PGO
+            # 粗位姿只用于视差加权，禁掉回环/PGO
             coarse_result = estimate_poses(
             coarse_paths, feature_type,
             enable_loop=False,
             enable_pgo=False,
-            enable_global_matching=False,        # ← 显式关闭（粗位姿用不到）
+            enable_global_matching=False,        # 粗位姿用不到
             )
             coarse_poses = coarse_result.poses
         except Exception as e:
@@ -343,7 +434,7 @@ def _two_stage_extract(
         logger.info("阶段 1: 粗位姿估计成功 %d/%d 帧",
                     n_pose_ok, len(coarse_poses))
 
-        # ---------- 阶段 2：打分 + 门控 + 视差加权 + 分层选择 ----------
+        # ---- 阶段 2：打分与选择 ----
         sample_indices = _make_sample_indices(total)
         logger.info("阶段 2: 打分采样点 %d 个", len(sample_indices))
 
@@ -372,8 +463,8 @@ def _two_stage_extract(
             )
             indices = np.linspace(0, total - 1, num_frames, dtype=int)
         else:
-            # 清晰度 × 光流 × (0.3 + 0.7×视差)：
-            # 白墙等低视差帧保留基础权重，占比低但不会被完全跳过
+            # 清晰度 × 光流 × (0.3 + 0.7×视差)：低视差帧保留基础权重，
+            # 占比低但不会被完全跳过
             score = sharp_full * flow_full
             weight_parallax = 0.3 + 0.7 * parallax_full
             weights = score * weight_parallax * valid.astype(np.float64)
@@ -396,14 +487,13 @@ def _two_stage_extract(
         logger.info("已清理粗提取临时目录: %s", coarse_dir)
 
 
-# ---------- 时间分层选择 ----------
+# ---- 时间分层选择 ----
 def _stratified_select(
     weights: np.ndarray,
     valid: np.ndarray,
     num_frames: int,
     n_bins: int = SELECT_BINS,
 ) -> np.ndarray:
-    """按时间分层选择帧。"""
     n = len(weights)
     if n == 0 or num_frames <= 0:
         logger.info("分层选择跳过: n=%d, num_frames=%d", n, num_frames)
@@ -460,14 +550,14 @@ def _stratified_select(
     return result
 
 
-# ---------- 打分：清晰度 + 光流 ----------
+# ---- 清晰度与光流打分 ----
 def _compute_gating_scores(
     cap: cv2.VideoCapture,
     indices: np.ndarray,
     flow_method: str,
     score_max_side: int = SCORE_MAX_SIDE,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """一次遍历同时计算每个采样帧的清晰度和光流分数。"""
+    """单次遍历同时算清晰度与光流，避免重复读帧。"""
     n = len(indices)
     sharpness = np.zeros(n, dtype=np.float64)
     flow = np.zeros(n, dtype=np.float64)
@@ -555,7 +645,6 @@ def _compute_gating_scores(
 
 
 def _gating_mask(sharp_full: np.ndarray, flow_full: np.ndarray) -> np.ndarray:
-    """根据清晰度和光流计算门控掩码。"""
     sharp_q = float(np.quantile(sharp_full, SHARPNESS_QUANTILE))
     flow_q = float(np.quantile(flow_full, FLOW_QUANTILE))
     sharp_med = float(np.median(sharp_full))
@@ -582,7 +671,6 @@ def _enforce_time_coverage(
     n_bins: int = TIME_COVERAGE_BINS,
     min_per_bin: int = TIME_COVERAGE_MIN_PER_BIN,
 ) -> np.ndarray:
-    """时间覆盖兜底：每个时间分箱至少保留 min_per_bin 个通过帧。"""
     valid = valid.copy()
     if total <= 0:
         return valid
@@ -609,7 +697,6 @@ def _enforce_time_coverage(
 
 
 def _lk_flow_magnitude(prev: np.ndarray, curr: np.ndarray) -> float:
-    """Lucas-Kanade 稀疏光流：在网格点上计算平均位移幅度。"""
     h, w = prev.shape
     step = 16
     y_coords = np.arange(0, h, step, dtype=np.float32)
@@ -632,17 +719,13 @@ def _lk_flow_magnitude(prev: np.ndarray, curr: np.ndarray) -> float:
     return float(np.mean(np.sqrt(np.sum(disp ** 2, axis=1))))
 
 
-# ---------- 视差打分 ----------
+# ---- 视差打分 ----
 def _compute_parallax_scores(
     total: int,
     coarse_indices: np.ndarray,
     coarse_poses: List,
 ) -> np.ndarray:
-    """基于粗位姿的相邻基线计算每帧视差分数。
-
-    用相机中心的欧氏距离（真正的基线）作为视差代理，避免 t 向量
-    受旋转影响导致的度量偏差。再加旋转角作为小幅补偿。
-    """
+    """用相机中心距离（真实基线）作视差代理，避免 t 向量受旋转影响；另加旋转角小幅补偿。"""
     valid_pairs = [(i, p) for i, p in enumerate(coarse_poses) if p is not None]
     if len(valid_pairs) < 2:
         logger.warning("有效粗位姿不足（%d < 2），视差分数置零。", len(valid_pairs))
@@ -671,14 +754,12 @@ def _compute_parallax_scores(
 
 
 def _rotation_angle(R: np.ndarray) -> float:
-    """从旋转矩阵提取旋转角（弧度）。"""
     rv, _ = cv2.Rodrigues(R)
     return float(np.linalg.norm(rv))
 
 
-# ---------- 采样与分配辅助 ----------
+# ---- 采样辅助 ----
 def _make_sample_indices(total: int) -> np.ndarray:
-    """构造打分用的采样索引，最多 MAX_SCORE_SAMPLES 个，并保证覆盖最后一帧。"""
     step = _sample_step(total)
     indices = np.arange(0, total, step, dtype=int)
     if indices.size == 0:
@@ -690,12 +771,10 @@ def _make_sample_indices(total: int) -> np.ndarray:
 
 
 def _sample_step(total: int) -> int:
-    """采样步长：使采样数不超过 MAX_SCORE_SAMPLES。"""
     return max(1, total // MAX_SCORE_SAMPLES)
 
 
 def _interp_to_full(sample_indices: np.ndarray, sample_scores: np.ndarray, total: int) -> np.ndarray:
-    """把采样分数线性插值扩展到全部帧。"""
     sample_indices = np.asarray(sample_indices)
     sample_scores = np.asarray(sample_scores, dtype=np.float64)
     if sample_indices.size == 0:
@@ -706,7 +785,7 @@ def _interp_to_full(sample_indices: np.ndarray, sample_scores: np.ndarray, total
 
 
 def _gaussian_smooth(scores: np.ndarray, sigma: float = 2.0) -> np.ndarray:
-    """对 1D 分数做高斯平滑，避免孤立峰值主导分配。"""
+    """平滑 1D 分数，避免孤立峰值主导分配。"""
     if len(scores) < 3 or sigma <= 0:
         return scores
     size = int(4 * sigma + 1) | 1  # 保证奇数
@@ -718,7 +797,7 @@ def _gaussian_smooth(scores: np.ndarray, sigma: float = 2.0) -> np.ndarray:
 
 
 def _deterministic_select(weights: np.ndarray, num_frames: int) -> np.ndarray:
-    """按权重确定性选择 num_frames 个下标（段内使用）。"""
+    """确定性选择，保证同输入同结果。"""
     n = len(weights)
     num_frames = min(num_frames, n)
     if num_frames >= n:
@@ -741,7 +820,6 @@ def _target_frame_count(
     min_frames: int,
     max_frames: int,
 ) -> int:
-    """按目标采样率换算帧数，夹到 [min_frames, max_frames] 与 total。"""
     raw = int(total * target_fps / orig_fps)
     n = min(max(raw, min_frames), max_frames)
     result = max(1, min(n, total))
@@ -753,8 +831,9 @@ def _target_frame_count(
     return result
 
 
-def _compute_resized_size(orig_w: int, orig_h: int, scale: float) -> Tuple[int, int]:
-    """计算缩放后尺寸，宽高取偶数（避免后续奇数尺寸的边界问题）。"""
+def _compute_resized_size(orig_w: int, orig_h: int, scale: float,
+                          log: bool = True) -> Tuple[int, int]:
+    """宽高取偶数，避免后续奇数尺寸的边界问题。"""
     w = int(orig_w * scale)
     h = int(orig_h * scale)
     if w % 2 != 0:
@@ -762,8 +841,9 @@ def _compute_resized_size(orig_w: int, orig_h: int, scale: float) -> Tuple[int, 
     if h % 2 != 0:
         h += 1
     result = (max(w, 2), max(h, 2))
-    logger.info("缩放尺寸: %dx%d (scale=%.2f) -> %dx%d",
-                orig_w, orig_h, scale, result[0], result[1])
+    if log:
+        logger.info("缩放尺寸: %dx%d (scale=%.2f) -> %dx%d",
+                    orig_w, orig_h, scale, result[0], result[1])
     return result
 
 
@@ -774,7 +854,6 @@ def _extract_indices(
     w: int,
     h: int,
 ) -> Tuple[List[str], np.ndarray]:
-    """按给定索引抽取帧并保存为 PNG。"""
     paths: List[str] = []
     used: List[int] = []
     read_fail = 0

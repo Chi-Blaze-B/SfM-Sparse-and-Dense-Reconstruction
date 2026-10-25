@@ -1,4 +1,4 @@
-"""视频转 SfM 稀疏/稠密重建 CLI 端。"""
+"""视频 / 图片集转 SfM 稀疏/稠密重建 CLI 端。"""
 
 import argparse
 import json
@@ -8,11 +8,12 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+from typing import Optional, Tuple
 
 import numpy as np
 import psutil
 
-from frames import extract_frames
+from frames import extract_frames, import_images
 from poses import estimate_poses, CameraPose, FrameStatus
 from exporter import (
     intr_from_K,
@@ -49,8 +50,13 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # 输入 / 输出
-    parser.add_argument("--video", type=str, required=True, help="输入视频文件路径")
+    # 输入 / 输出：视频与图片集二选一
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--video", type=str, help="输入视频文件路径")
+    src.add_argument(
+        "--image-dir", type=str,
+        help="输入图片集目录（与 --video 二选一；顶层无图片时会递归查找子目录）",
+    )
     parser.add_argument("--output-dir", type=str, default="./sfm_output",
                         help="输出目录（存放点云 / 相机位姿 / 内参）")
     parser.add_argument("--workdir", type=str, default="./workdir",
@@ -63,16 +69,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="运行模式：sparse=只跑 SfM 稀疏重建；dense=SfM + SGBM 稠密重建",
     )
 
-    # 帧提取
+    # 帧提取（仅 --video）
     parser.add_argument(
         "--sampling-mode", type=str,
         choices=["uniform", "smart", "two-stage"], default="uniform",
-        help="帧采样策略：uniform / smart（光流）/ two-stage（视差+光流+纹理）",
+        help="帧采样策略（仅视频）：uniform / smart（光流）/ two-stage（视差+光流+纹理）",
     )
-    parser.add_argument("--fps", type=float, default=15.0, help="目标帧率（均匀采样模式）")
-    parser.add_argument("--scale", type=float, default=0.5, help="缩放系数 (0<scale<=1)")
-    parser.add_argument("--min-frames", type=int, default=30, help="最少提取帧数")
-    parser.add_argument("--max-frames", type=int, default=200, help="最多提取帧数")
+    parser.add_argument("--fps", type=float, default=15.0,
+                        help="目标帧率（仅视频，均匀采样模式）")
+    parser.add_argument("--scale", type=float, default=None,
+                        help="缩放系数 0<scale<=1（视频默认 0.5；图片集默认 1.0=直接引用原图）")
+    parser.add_argument("--min-frames", type=int, default=None,
+                        help="最少提取帧数（仅视频，默认 30）")
+    parser.add_argument("--max-frames", type=int, default=None,
+                        help="最多帧数/图片数（视频默认 200；图片集默认 0=全部，>0 时均匀抽取）")
+
+    # 相机标定（可选）
+    parser.add_argument("--camera-matrix", type=str, default=None,
+                        help="3x3 内参矩阵 .npy（可选；图片集有标定时强烈建议提供）")
+    parser.add_argument("--dist-coeffs", type=str, default=None,
+                        help="畸变系数 .npy：4/5/8 值走 OpenCV，12 值走 COLMAP THIN_PRISM_FISHEYE")
 
     # 位姿估计
     parser.add_argument(
@@ -97,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="启用全局词袋检索匹配（更稳但更慢，长序列建议开启）",
     )
 
-    # 稠密重建参数（仅 --mode dense 时生效）
+    # 稠密重建参数
     dense_group = parser.add_argument_group("稠密重建（--mode dense 时生效）")
     dense_group.add_argument("--dense-downscale", type=int, default=2,
                              help="稠密重建时帧降采样倍数，越大越快，精度越低")
@@ -120,7 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def load_poses(poses_data: np.ndarray) -> list:
-    """从定长 [n,4,4] 数组还原位姿列表，NaN 行表示位姿缺失。"""
+    """从 [n,4,4] 定长数组还原位姿列表，NaN 行表示位姿缺失。"""
     poses = []
     for p in poses_data:
         if np.isnan(p).any():
@@ -131,7 +147,7 @@ def load_poses(poses_data: np.ndarray) -> list:
 
 
 def save_poses(poses: list, path: Path) -> None:
-    """位姿列表保存为定长 [n,4,4] 数组，缺失位姿填 NaN。"""
+    """位姿存成 [n,4,4] 定长数组，缺失位姿填 NaN。"""
     poses_arr = np.full((len(poses), 4, 4), np.nan, dtype=np.float32)
     for i, p in enumerate(poses):
         if p is not None:
@@ -139,14 +155,31 @@ def save_poses(poses: list, path: Path) -> None:
     np.save(path, poses_arr)
 
 
-# ---------------------------------------------------------------------------
-# 主流程
-# ---------------------------------------------------------------------------
+# ---- 输入解析 ----
+def _resolve_source_args(args: argparse.Namespace) -> None:
+    image_mode = args.image_dir is not None
+    if args.scale is None:
+        args.scale = 1.0 if image_mode else 0.5
+    if args.min_frames is None:
+        args.min_frames = 2 if image_mode else 30
+    if args.max_frames is None:
+        args.max_frames = 0 if image_mode else 200
 
+
+def _load_calibration(
+    args: argparse.Namespace,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    camera_matrix = np.load(args.camera_matrix) if args.camera_matrix else None
+    dist_coeffs = np.load(args.dist_coeffs) if args.dist_coeffs else None
+    return camera_matrix, dist_coeffs
+
+
+# ---- 主流程 ----
 def run_pipeline(args: argparse.Namespace) -> None:
     overall_start = time.time()
     enable_dense = (args.mode == "dense")
     n_steps = 4 if enable_dense else 3
+    image_mode = args.image_dir is not None
 
     workdir = Path(args.workdir)
     if args.reuse_dir is not None:
@@ -166,13 +199,19 @@ def run_pipeline(args: argparse.Namespace) -> None:
     poses_dir.mkdir(exist_ok=True)
 
     logger.info("=" * 60)
-    logger.info("  视频 → SfM %s重建",
+    logger.info("  %s → SfM %s重建",
+                "图片集" if image_mode else "视频",
                 "稀疏 + 稠密" if enable_dense else "稀疏")
     logger.info("=" * 60)
     logger.info("运行模式: %s", args.mode)
+    if image_mode:
+        logger.info("图片集: %s", os.path.abspath(args.image_dir))
+    else:
+        logger.info("视频: %s", os.path.abspath(args.video))
 
-    # ---- 步骤 1：抽帧 ----
-    logger.info("[1/%d] 正在提取帧...", n_steps)
+    # ---- 步骤 1：抽帧 / 导入图片集 ----
+    logger.info("[1/%d] %s...", n_steps,
+                "正在导入图片集" if image_mode else "正在提取视频帧")
     t0 = time.time()
 
     frame_paths_file = workdir / "frame_paths.txt"
@@ -182,7 +221,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
     can_reuse_frames = frame_meta.can_reuse_frames(workdir)
 
     current_meta = {
-        "video": os.path.abspath(args.video),
+        "source_type": "images" if image_mode else "video",
+        "video": None if image_mode else os.path.abspath(args.video),
+        "image_dir": os.path.abspath(args.image_dir) if image_mode else None,
         "scale": args.scale,
         "fps": args.fps,
         "sampling_mode": args.sampling_mode,
@@ -195,7 +236,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         mismatch_reasons = frame_meta.check_meta(meta_path, current_meta)
         if mismatch_reasons:
             logger.warning(
-                "  提取参数变化（%s），重新提取帧并作废下游缓存（位姿 / 点云 / 稠密帧对）",
+                "  输入/提取参数变化（%s），重新准备帧并作废下游缓存（位姿 / 点云 / 稠密帧对）",
                 "; ".join(mismatch_reasons),
             )
             can_reuse_frames = False
@@ -207,6 +248,17 @@ def run_pipeline(args: argparse.Namespace) -> None:
     if can_reuse_frames:
         frame_paths = [p.strip() for p in frame_paths_file.read_text().splitlines()]
         logger.info("已从 %s 加载 %d 帧（跳过抽帧）", workdir, len(frame_paths))
+    elif image_mode:
+        frame_paths = import_images(
+            args.image_dir,
+            output_dir=str(frame_dir),
+            scale=args.scale,
+            max_frames=args.max_frames,
+        )
+        frame_paths_file.write_text("\n".join(frame_paths))
+        frame_meta.write_meta(meta_path, current_meta)
+        logger.info("已导入 %d 张图片（耗时 %.1fs）",
+                    len(frame_paths), time.time() - t0)
     else:
         smart_sampling = args.sampling_mode != "uniform"
         two_stage = args.sampling_mode == "two-stage"
@@ -232,7 +284,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         logger.error("至少需要 2 帧。")
         sys.exit(1)
 
-    # ---- 帧缓存：先按配置建好缓存实例（不预加载），再读首帧测尺寸 ----
+    # ---- 帧缓存：先建实例，稍后预加载 ----
     cache_mb = int(getattr(args, "frame_cache_mb", 1500))
     try:
         from frame_cache import (
@@ -248,7 +300,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     if _configure_cache is not None and cache_mb > 0:
         _configure_cache(max_bytes=cache_mb * 1024 * 1024)
 
-    # 读首帧测尺寸（走缓存；禁用缓存时退化到 cv2.imread）
+    # 读首帧测尺寸；缓存禁用时退化为 cv2.imread
     if _get_image is not None:
         _img = _get_image(frame_paths[0])
     else:
@@ -260,7 +312,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     h, w = _img.shape[:2]
     logger.info("帧分辨率: %dx%d", w, h)
 
-    # ---- 帧缓存：预加载到内存，加速位姿估计 / 稠密重建的重复读盘 ----
+    # ---- 帧缓存：预加载，避免位姿估计 / 稠密重建重复读盘 ----
     if _configure_cache is not None:
         if cache_mb > 0:
             t_cache = time.time()
@@ -306,8 +358,22 @@ def run_pipeline(args: argparse.Namespace) -> None:
             workdir,
         )
     else:
+        camera_matrix, dist_coeffs = _load_calibration(args)
+        if camera_matrix is not None:
+            if image_mode and args.scale < 0.999:
+                logger.warning(
+                    "  提供了内参但 scale=%.2f：内参对应的是原始分辨率，"
+                    "请改用 --scale 1.0 或自行缩放内参", args.scale)
+            logger.info("使用给定内参: fx=%.2f fy=%.2f cx=%.2f cy=%.2f",
+                        camera_matrix[0, 0], camera_matrix[1, 1],
+                        camera_matrix[0, 2], camera_matrix[1, 2])
+        if dist_coeffs is not None:
+            n_d = int(np.asarray(dist_coeffs).size)
+            logger.info("使用给定畸变系数: %d 个（%s）", n_d,
+                        "COLMAP THIN_PRISM_FISHEYE" if n_d == 12 else "OpenCV")
+
         focal_guess = None
-        if args.use_focal_guess:
+        if args.use_focal_guess and camera_matrix is None:
             focal_guess = float(max(w, h))
             fov_deg = 2.0 * np.degrees(np.arctan(max(w, h) / (2.0 * focal_guess)))
             axis = "水平" if w >= h else "垂直"
@@ -320,6 +386,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 args.feature_type,
                 focal_guess=focal_guess,
                 aspect_ratio=1.0,
+                dist_coeffs=dist_coeffs,
+                camera_matrix=camera_matrix,
                 enable_loop=not args.no_loop,
                 enable_pgo=not args.no_pgo,
                 enable_global_matching=args.enable_global_matching,
@@ -382,10 +450,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 len(frame_paths), valid_count, time.time() - t0)
 
     if valid_count < 3:
-        logger.error("有效位姿过少。请检查视频质量。")
+        logger.error("有效位姿过少。请检查素材质量（平移、纹理、模糊）。")
         sys.exit(1)
 
-    # ---- 步骤 3：稠密重建（仅 dense 模式） ----
+    # ---- 步骤 3：稠密重建 ----
     import threading
     import signal
 
@@ -405,6 +473,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
             else:
                 _kf = cached_keyframes
             _intr = sfm_result.intrinsics if sfm_result else intr_from_K(K)
+            if sfm_result is None:
+                _, _dist_dense = _load_calibration(args)
+                if _dist_dense is not None:
+                    _intr.dist = np.asarray(_dist_dense, dtype=np.float64)
 
             dense_cfg = DenseConfig(
                 downscale=args.dense_downscale,
@@ -447,7 +519,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             finally:
                 signal.signal(signal.SIGINT, _old_sigint)
 
-    # ---- 步骤 4（或 3）：导出 ----
+    # ---- 步骤 4：导出 ----
     logger.info("[%d/%d] 正在导出结果...", n_steps, n_steps)
     t0 = time.time()
 
@@ -477,7 +549,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     try:
         report = {
-            "video": os.path.abspath(args.video),
+            "source_type": "images" if image_mode else "video",
+            "video": None if image_mode else os.path.abspath(args.video),
+            "image_dir": os.path.abspath(args.image_dir) if image_mode else None,
             "run_mode": args.mode,
             "num_frames": len(frame_paths),
             "num_valid_poses": int(valid_count),
@@ -522,8 +596,21 @@ def cli(argv: list[str] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if not os.path.isfile(args.video):
+    _resolve_source_args(args)
+
+    if args.image_dir is not None:
+        if not os.path.isdir(args.image_dir):
+            logger.error("图片集目录不存在: %s", args.image_dir)
+            sys.exit(1)
+    elif not os.path.isfile(args.video):
         logger.error("视频文件不存在: %s", args.video)
+        sys.exit(1)
+
+    if args.camera_matrix and not os.path.isfile(args.camera_matrix):
+        logger.error("内参文件不存在: %s", args.camera_matrix)
+        sys.exit(1)
+    if args.dist_coeffs and not os.path.isfile(args.dist_coeffs):
+        logger.error("畸变系数文件不存在: %s", args.dist_coeffs)
         sys.exit(1)
 
     run_pipeline(args)
