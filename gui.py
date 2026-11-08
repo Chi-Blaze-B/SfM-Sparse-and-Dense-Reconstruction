@@ -1,5 +1,6 @@
 """视频 / 图片集转 SfM 稀疏/稠密重建 — PySide6 图形界面。"""
 
+import argparse
 import logging
 import os
 import sys
@@ -49,7 +50,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QPoint, QPropertyAnimation, QTimer
 from PySide6.QtGui import QPixmap, QImage, QFont, QColor, QPainter
 
-from frames import extract_frames, import_images, list_images
+from frames import extract_frames, import_images, list_images, exif_focal_ratio
 try:
     from frame_cache import (
         get_image as _cached_get_image,
@@ -799,6 +800,8 @@ class PipelineWorker(QThread):
             self._run_pipeline()
         except Exception as e:
             import traceback
+            # _log 只进界面文本框；同时写一份到 logging，否则日志文件里查不到失败原因
+            logger.exception("SfM 流程异常终止: %s", e)
             self._log(f"错误: {e}")
             self._log(traceback.format_exc())
             self.finished_signal.emit(False, str(e))
@@ -912,19 +915,11 @@ class PipelineWorker(QThread):
         h, w = _img.shape[:2]
         self._log(f"  分辨率: {w}x{h}")
 
-        # ---- 帧缓存预加载 ----
-        if _configure_cache is not None:
-            if _cache_mb > 0:
-                t_cache = time.time()
-                _configure_cache(max_bytes=_cache_mb * 1024 * 1024,
-                                 preload=frame_paths)
-                self._log(
-                    f"  帧图像已预加载到内存（上限 {_cache_mb} MiB，"
-                    f"耗时 {time.time() - t_cache:.1f}s）"
-                )
-            else:
-                _configure_cache(max_bytes=0)
-                self._log("  帧缓存已禁用（逐次读盘）")
+        # ---- 帧缓存：这里只设上限，预加载推迟到稠密重建之前 ----
+        # 位姿估计每帧只解码一次，预加载省不到工作量，还会挤占特征提取的并行预算。
+        if _configure_cache is not None and _cache_mb <= 0:
+            _configure_cache(max_bytes=0)
+            self._log("  帧缓存已禁用（逐次读盘）")
 
         self.frame_paths_signal.emit(frame_paths)
 
@@ -942,6 +937,7 @@ class PipelineWorker(QThread):
         sfm_result = None
         K = None
         cached_keyframes = None
+        cached_dist = None
         cached_loop_closures = []
         cached_frame_status = None
 
@@ -970,6 +966,7 @@ class PipelineWorker(QThread):
                         cached_loop_closures = [tuple(x)
                                                 for x in _m.get("loop_closures", [])]
                         cached_frame_status = _m.get("frame_status")
+                        cached_dist = _m.get("dist")
                     except Exception as e:
                         self._log(f"  ⚠️  读取 sfm_meta.json 失败: {e}")
 
@@ -983,25 +980,76 @@ class PipelineWorker(QThread):
                 has_poses = False
 
         if not has_poses:
+            # 内参优先级：手动指定 > EXIF > 启发式（1.2×长边；勾选焦距猜测时 1.0×）
+            camera_matrix = None
+            dist_coeffs = None
+            if c.get("intrinsics_mode") == "manual":
+                _kp = c.get("camera_matrix_path") or ""
+                _dp = c.get("dist_coeffs_path") or ""
+                if _kp:
+                    try:
+                        camera_matrix = np.load(_kp)
+                    except Exception as e:
+                        self._log(f"  [WARN] 读取相机矩阵失败: {e}")
+                if _dp:
+                    try:
+                        dist_coeffs = np.load(_dp)
+                    except Exception as e:
+                        self._log(f"  [WARN] 读取畸变系数失败: {e}")
+                if camera_matrix is None:
+                    self._log("  [WARN] 手动内参模式但没有可用的相机矩阵，退回自动")
+
             focal_guess = None
-            if c.get("use_focal_guess"):
+            if camera_matrix is not None:
+                self._log(
+                    f"  使用给定内参: fx={camera_matrix[0, 0]:.1f} "
+                    f"fy={camera_matrix[1, 1]:.1f} cx={camera_matrix[0, 2]:.1f} "
+                    f"cy={camera_matrix[1, 2]:.1f}")
+                if dist_coeffs is not None:
+                    self._log(f"  使用给定畸变系数: {np.asarray(dist_coeffs).size} 个")
+            elif c.get("use_focal_guess"):
                 focal_guess = float(max(w, h))
                 fov_deg = 2.0 * np.degrees(np.arctan(max(w, h) / (2.0 * focal_guess)))
                 axis = "水平" if w >= h else "垂直"
                 self._log(f"  初始焦距猜测: {focal_guess:.1f}px（约 {fov_deg:.0f}° {axis} FOV）")
+            elif image_mode:
+                _src = list_images(c.get("image_dir") or "")
+                _ratio = exif_focal_ratio(_src[0]) if _src else None
+                if _ratio is not None:
+                    focal_guess = _ratio * w
+                    self._log(f"  按 EXIF 估计初始焦距: {focal_guess:.1f}px"
+                              f"（{_ratio:.2f}×宽度）")
+                else:
+                    self._log("  图片无 EXIF 焦距，使用默认启发式（1.2×长边）")
+            else:
+                self._log("  视频输入无 EXIF 焦距，使用默认启发式（1.2×长边）")
 
             feature_type = c.get("feature_type", "orb")
-            label = {"orb": "ORB", "sift": "SIFT", "rootsift": "RootSIFT"}.get(feature_type, feature_type.upper())
-            self._log(f"  使用 {label} + E + EM-BA 进行位姿估算...")
+            label = {"orb": "ORB", "sift": "SIFT",
+                     "rootsift": "RootSIFT（实验）"}.get(feature_type,
+                                                         feature_type.upper())
+            self._log(
+                f"  使用 {label} 进行增量式重建"
+                f"（E 初始化 → PnP 跟踪 → 局部/全局 BA → 回环 / PGO）...")
+            if feature_type == "rootsift":
+                self._log(
+                    "  提示：RootSIFT 的匹配阈值没有按新管线重新标定，"
+                    "不确定时建议改用 SIFT。")
             try:
                 sfm_result = estimate_poses(
                     frame_paths,
                     feature_type,
                     focal_guess=focal_guess,
                     aspect_ratio=1.0,
+                    dist_coeffs=dist_coeffs,
+                    camera_matrix=camera_matrix,
                     enable_loop=c.get("enable_loop", True),
                     enable_pgo=c.get("enable_pgo", True),
                     enable_global_matching=c.get("enable_global_matching", False),
+                    self_calibrate=c.get("self_calibrate", True),
+                    self_calib_iter=bool(c.get("self_calib_iter", False)),
+                    rot_edge_weight=float(c.get("rot_edge_weight", 100.0)),
+                    pose_outlier_deg=float(c.get("pose_outlier_deg", 12.0)),
                 )
                 K = sfm_result.intrinsics.K
                 poses = sfm_result.poses
@@ -1024,6 +1072,26 @@ class PipelineWorker(QThread):
                         f"  ⚠️  超过 40% 的帧丢失/无效（{_n_lost} / {len(frame_paths)}），"
                         f"建议更换素材。"
                     )
+
+            _gt = c.get("gt_model")
+            if _gt:
+                self._log("  ── 参考模型评测 ──")
+                try:
+                    from eval_tools import evaluate_run, format_summary
+                    _metrics = evaluate_run(
+                        sfm_result, frame_paths, _gt,
+                        img_scale=float(c.get("scale", 1.0)) if image_mode else 1.0)
+                    for _line in format_summary(_metrics).splitlines():
+                        self._log("  " + _line)
+                    try:
+                        (output_dir / "evaluation.json").write_text(
+                            json.dumps(_metrics, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+                    except Exception as e:
+                        self._log(f"  ⚠️  写入 evaluation.json 失败: {e}")
+                except Exception as e:
+                    self._log(f"  ⚠️  评测失败: {e}")
+
             np.save(workdir / "intrinsics.npy", K)
             poses_arr = np.full((len(poses), 4, 4), np.nan, dtype=np.float32)
             for i, p in enumerate(poses):
@@ -1042,6 +1110,10 @@ class PipelineWorker(QThread):
                                       for a, b in sfm_result.loop_closures],
                     "frame_status": (list(sfm_result.frame_status)
                                      if sfm_result.frame_status else None),
+                    # 自标定 / 用户给定的畸变模型必须落盘，复用目录时稠密要靠它反畸变
+                    "dist": (None if sfm_result.intrinsics.dist is None
+                             else [float(v) for v in
+                                   np.asarray(sfm_result.intrinsics.dist).ravel()]),
                 }, ensure_ascii=False))
             except Exception as e:
                 self._log(f"  ⚠️  写入 sfm_meta.json 失败: {e}")
@@ -1084,6 +1156,15 @@ class PipelineWorker(QThread):
         if enable_dense:
             self._log(f"\n[3/{n_steps}] 正在稠密重建...")
             self._set_progress(55, "正在稠密重建...")
+            # 稠密重建跨帧对反复解码同一帧，这里才需要缓存。
+            if _configure_cache is not None and _cache_mb > 0:
+                t_cache = time.time()
+                _configure_cache(max_bytes=_cache_mb * 1024 * 1024,
+                                 preload=frame_paths)
+                self._log(
+                    f"  帧图像已预加载到内存（上限 {_cache_mb} MiB，"
+                    f"耗时 {time.time() - t_cache:.1f}s）"
+                )
 
             try:
                 from dense import dense_reconstruct, DenseConfig, DenseAbortedError
@@ -1097,11 +1178,14 @@ class PipelineWorker(QThread):
                 else:
                     _kf = cached_keyframes
                 _intr = sfm_result.intrinsics if sfm_result else intr_from_K(K)
+                if sfm_result is None and cached_dist:
+                    _intr.dist = np.asarray(cached_dist, dtype=np.float64)
 
                 dense_cfg = DenseConfig(
                     downscale=int(c.get("dense_downscale", 2)),
                     max_pairs=int(c.get("dense_max_pairs", 60)),
                     voxel_ratio=float(c.get("dense_voxel_ratio", 0.005)),
+                    fusion_min_views=int(c.get("dense_min_views", 1)),
                 )
                 dense_path = str(output_dir / "dense_points.ply")
 
@@ -1437,6 +1521,7 @@ class MainWindow(QMainWindow):
         row.addWidget(btn)
         row.setSpacing(8)
         setattr(self, f"{name}_edit", edit)
+        setattr(self, f"{name}_btn", btn)
         return row
 
     def _make_step_header(self, title: str) -> QWidget:
@@ -1558,6 +1643,37 @@ class MainWindow(QMainWindow):
             self.cache_hint.setText("○ 未检测到缓存：将从头开始")
             self.cache_hint.setStyleSheet(f"color: {C['text_muted']}; {base}")
 
+    def _sync_global_match_enabled(self, *_):
+        """全局匹配依赖回环 BoW；回环关闭时词袋不训练，勾了也不会执行。"""
+        on = self.loop_cb.isChecked()
+        self.global_match_cb.setEnabled(on)
+        tip = (
+            "启用全局词袋检索匹配：除相邻帧外，还会在历史关键帧中检索共视候选做匹配。\n"
+            "更稳（尤其长序列、宽基线、回环场景），但耗时明显增加。\n"
+            "默认关闭。"
+        )
+        if not on:
+            tip += "\n（当前不可用：需先启用「回环检测」，全局匹配复用它的词袋）"
+        self.global_match_cb.setToolTip(tip)
+
+    def _sync_intrinsics_ui(self, *_):
+        """自动模式下内参由 EXIF / 启发式决定，手动文件输入置灰。"""
+        manual = self.intr_mode_combo.currentIndex() == 1
+        for n in ("camera_matrix", "dist_coeffs"):
+            getattr(self, f"{n}_edit").setEnabled(manual)
+            getattr(self, f"{n}_btn").setEnabled(manual)
+        # 自标定只在「没有提供标定」时有意义
+        if hasattr(self, "self_calib_cb"):
+            self.self_calib_cb.setEnabled(not manual)
+        if hasattr(self, "self_calib_iter_cb"):
+            self._sync_self_calib_ui()
+
+    def _sync_self_calib_ui(self, *_):
+        """k1 迭代只在自动内参 + 开启自标定时才有意义。"""
+        on = (self.self_calib_cb.isChecked()
+              and self.intr_mode_combo.currentIndex() == 0)
+        self.self_calib_iter_cb.setEnabled(on)
+
     def _add_param_section(self, parent_layout):
         card = RoundedCard()
         cl = QVBoxLayout(card)
@@ -1629,11 +1745,16 @@ class MainWindow(QMainWindow):
         # ---- 相机位姿估算 ----
         self.feature_type_label = StyledLabel("特征描述子:", font_size=11, color=C["text_secondary"])
         self.feature_type_combo = StyledComboBox()
-        self.feature_type_combo.addItems(["ORB（快）", "SIFT（稳）", "RootSIFT（稳+）"])
+        self.feature_type_combo.addItems(["ORB（快）", "SIFT（稳）", "RootSIFT（实验）"])
         self.feature_type_combo.setToolTip(
-            "ORB：二进制描述子，Hamming 距离匹配，速度快。\n"
-            "SIFT：浮点描述子，L2 距离匹配，更稳健但较慢。\n"
-            "RootSIFT：SIFT 归一化版本，匹配更稳，速度与 SIFT 相当。"
+            "ORB：二进制描述子，Hamming 距离，速度最快；纹理丰富时默认够用。\n"
+            "SIFT：浮点描述子，L2 距离，低纹理 / 短序列更稳，速度较慢。\n"
+            "RootSIFT：SIFT 的归一化版本，对曝光变化更鲁棒。\n"
+            "        但本项目的匹配阈值没有按新管线重新标定，暂时没有对比数据，\n"
+            "        不确定时优先用 SIFT。\n"
+            "\n"
+            "建点与补观测现在都带几何校验（F/H 验证 + 3 px 重投影门槛），\n"
+            "描述子主要影响匹配数量与耗时，不再是外点的主要来源。"
         )
 
         self.focal_guess_label = StyledLabel("初始焦距:", font_size=11, color=C["text_secondary"])
@@ -1662,13 +1783,27 @@ class MainWindow(QMainWindow):
 
         self.global_match_cb = QCheckBox("启用全局匹配")
         self.global_match_cb.setChecked(False)
-        self.global_match_cb.setStyleSheet(f"color: {C['text_primary']}; font-size: 11px; font-weight: 500;")
+        # 同一个坑：回环关闭时这个框会被禁用，裸 color 会让它看着仍可点
+        self.global_match_cb.setStyleSheet(
+            f"QCheckBox {{ color: {C['text_primary']}; font-size: 11px; font-weight: 500; }}"
+            f"QCheckBox:disabled {{ color: {C['text_muted']}; }}")
         self.global_match_cb.setToolTip(
             "启用全局词袋检索匹配：除相邻帧外，还会在历史关键帧中检索共视候选做匹配。\n"
             "更稳（尤其长序列、宽基线、回环场景），但耗时明显增加。\n"
             "默认关闭。"
         )
         self.global_match_label = StyledLabel("全局匹配:", font_size=11, color=C["text_secondary"])
+        # 全局匹配复用回环的 BoW 词袋，回环关掉时勾了也不会执行，这里做联动
+        self.loop_cb.stateChanged.connect(self._sync_global_match_enabled)
+        self._sync_global_match_enabled()
+
+        self.intr_mode_combo = StyledComboBox()
+        self.intr_mode_combo.addItems(["自动（EXIF → 启发式）", "手动指定"])
+        self.intr_mode_combo.setToolTip(
+            "相机内参来源。\n"
+            "自动：优先读 EXIF 的 35mm 等效焦距；没有 EXIF 时用 1.2×长边的启发值。\n"
+            "手动：指定内参矩阵 .npy 和畸变系数 .npy（有标定时精度最好）。")
+        self.intr_mode_combo.currentTextChanged.connect(self._sync_intrinsics_ui)
 
         cl.addWidget(self._make_step_header("相机位姿估算"))
         f2 = self._make_form()
@@ -1677,6 +1812,60 @@ class MainWindow(QMainWindow):
         f2.addRow(self.loop_label, self.loop_cb)
         f2.addRow(self.pgo_label, self.pgo_cb)
         f2.addRow(self.global_match_label, self.global_match_cb)
+        f2.addRow(StyledLabel("内参来源:", font_size=11, color=C["text_secondary"]),
+                  self.intr_mode_combo)
+        f2.addRow(StyledLabel("相机矩阵:", font_size=11, color=C["text_secondary"]),
+                  self._make_path_row("camera_matrix"))
+        f2.addRow(StyledLabel("畸变系数:", font_size=11, color=C["text_secondary"]),
+                  self._make_path_row("dist_coeffs"))
+        self.self_calib_cb = QCheckBox("自标定径向畸变 k1")
+        self.self_calib_cb.setChecked(True)
+        # 只用裸 color 声明会把禁用态也染成正常色，必须显式给 :disabled 规则
+        self.self_calib_cb.setStyleSheet(
+            f"QCheckBox {{ color: {C['text_primary']}; font-size: 11px; font-weight: 500; }}"
+            f"QCheckBox:disabled {{ color: {C['text_muted']}; }}")
+        self.self_calib_cb.setToolTip(
+            "仅在「自动」内参模式下生效（没有相机矩阵 / 畸变系数时）。\n"
+            "BA 里把 k1 当共享参数估计；若 |k1| 显著，会用去畸变后的特征\n"
+            "再跑一遍，耗时约翻倍。有标定数据时请直接填畸变系数，不要依赖它。")
+        f2.addRow(StyledLabel("径向畸变:", font_size=11, color=C["text_secondary"]),
+                  self.self_calib_cb)
+
+        self.self_calib_iter_cb = QCheckBox("残余 k1 迭代（第三遍）")
+        self.self_calib_iter_cb.setChecked(False)
+        self.self_calib_iter_cb.setStyleSheet(
+            f"QCheckBox {{ color: {C['text_primary']}; font-size: 11px; font-weight: 500; }}"
+            f"QCheckBox:disabled {{ color: {C['text_muted']}; }}")
+        self.self_calib_iter_cb.setToolTip(
+            "第二遍之后再估一次残余 k1，显著时用合成值跑第三遍。\n"
+            "south-building 实测：k1 误差 40%→14%、中心 17%→9%、整圈形变减半，\n"
+            "但相邻帧旋转变差、耗时约 +20%。默认关闭。")
+        f2.addRow(StyledLabel("k1 迭代:", font_size=11, color=C["text_secondary"]),
+                  self.self_calib_iter_cb)
+        self.self_calib_cb.stateChanged.connect(self._sync_self_calib_ui)
+
+        self.rot_edge_spin = StyledSpinBox()
+        self.rot_edge_spin.setRange(0, 10000)
+        self.rot_edge_spin.setValue(100)
+        self.rot_edge_spin.setSingleStep(50)
+        self.rot_edge_spin.setToolTip(
+            "最终全局 BA 中两视图旋转约束的权重（残差单位弧度）。\n"
+            "来自 E 矩阵、独立于地图，用来抑制累积旋转漂移；0 表示关闭。\n"
+            "实测收益有限（朝向对齐 3.50°→3.26°），默认 100。")
+        f2.addRow(StyledLabel("旋转约束:", font_size=11, color=C["text_secondary"]),
+                  self.rot_edge_spin)
+
+        self.pose_outlier_spin = StyledDoubleSpinBox()
+        self.pose_outlier_spin.setRange(0.0, 60.0)
+        self.pose_outlier_spin.setValue(12.0)
+        self.pose_outlier_spin.setSingleStep(1.0)
+        self.pose_outlier_spin.setToolTip(
+            "位姿校验阈值：与最近邻居的最小相对旋转偏差超过该角度，\n"
+            "该帧会被标记为 LOST、不出现在输出里。0 表示关闭。")
+        f2.addRow(StyledLabel("位姿校验:", font_size=11, color=C["text_secondary"]),
+                  self.pose_outlier_spin)
+
+        self._sync_intrinsics_ui()
         cl.addLayout(f2)
 
         # ---- 稠密参数（仅稠密模式） ----
@@ -1709,6 +1898,15 @@ class MainWindow(QMainWindow):
                   self.dense_pairs_spin)
         f3.addRow(StyledLabel("体素比例:", font_size=11, color=C["text_secondary"]),
                   self.dense_voxel_spin)
+
+        self.dense_min_views_spin = StyledSpinBox()
+        self.dense_min_views_spin.setRange(1, 5)
+        self.dense_min_views_spin.setValue(1)
+        self.dense_min_views_spin.setToolTip(
+            "一个体素至少被多少个帧对命中才保留。\n"
+            "1 = 不过滤（默认）；2 去掉单帧对产生的重复点，点云会更稀疏。")
+        f3.addRow(StyledLabel("融合最小帧对:", font_size=11, color=C["text_secondary"]),
+                  self.dense_min_views_spin)
         dp.addLayout(f3)
         cl.addWidget(self.dense_param_widget)
 
@@ -1721,8 +1919,9 @@ class MainWindow(QMainWindow):
         self.frame_cache_spin.setSingleStep(256)
         self.frame_cache_spin.setToolTip(
             "帧图像内存缓存上限（MiB）。\n"
-            "抽帧完成后一次性预加载到内存，避免位姿估计 / 稠密重建 /\n"
-            "帧预览缩略图对同一帧反复读盘 + 解码。\n"
+            "GUI 预览和稠密重建会反复解码同一帧，缓存省的是这部分开销。\n"
+            "位姿估计阶段不预加载：特征提取每帧只读一次，预加载没有收益，\n"
+            "还会挤占特征提取的并行内存预算。\n"
             "设为 0 表示禁用缓存（退回逐次 cv2.imread）。\n"
             "参考：scale=0.5 的 1080p 帧约 1.5 MiB/帧，1500 MiB 约可缓存 1000 帧。"
         )
@@ -1812,6 +2011,9 @@ class MainWindow(QMainWindow):
             path, _ = QFileDialog.getOpenFileName(self, "选择视频", "", "视频文件 (*.mp4 *.avi *.mov *.mkv);;所有文件 (*)")
         elif kind == "dir":
             path = QFileDialog.getExistingDirectory(self, "选择目录")
+        elif kind in ("camera_matrix", "dist_coeffs"):
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择 .npy 文件", "", "NumPy 数组 (*.npy);;所有文件 (*)")
         else:
             path, _ = QFileDialog.getSaveFileName(self, "保存文件", "")
         if path:
@@ -1879,6 +2081,7 @@ class MainWindow(QMainWindow):
             "image_dir": source_path if image_mode else None,
             "output_dir": output_dir,
             "workdir": workdir,
+            "gt_model": getattr(self, "gt_model_path", None),
             "run_mode": run_mode,
             "sampling_mode": sampling_mode,
             "fps": self.fps_spin.value(),
@@ -1889,10 +2092,19 @@ class MainWindow(QMainWindow):
             "enable_loop": self.loop_cb.isChecked(),
             "enable_pgo": self.pgo_cb.isChecked(),
             "enable_global_matching": self.global_match_cb.isChecked(),
+            "intrinsics_mode": ("manual" if self.intr_mode_combo.currentIndex() == 1
+                                else "auto"),
+            "camera_matrix_path": self.camera_matrix_edit.text().strip(),
+            "dist_coeffs_path": self.dist_coeffs_edit.text().strip(),
+            "self_calibrate": self.self_calib_cb.isChecked(),
+            "self_calib_iter": self.self_calib_iter_cb.isChecked(),
+            "rot_edge_weight": float(self.rot_edge_spin.value()),
+            "pose_outlier_deg": float(self.pose_outlier_spin.value()),
             "feature_type": feature_type,
             "dense_downscale": self.dense_downscale_spin.value(),
             "dense_max_pairs": self.dense_pairs_spin.value(),
             "dense_voxel_ratio": self.dense_voxel_spin.value(),
+            "dense_min_views": self.dense_min_views_spin.value(),
             "frame_cache_mb": self.frame_cache_spin.value(),
         }
 
@@ -1926,7 +2138,10 @@ class MainWindow(QMainWindow):
             self._log(f"⚙️   帧率:      {config['fps']} FPS")
             self._log(f"📐  缩放比例:  {config['scale']:.2f}")
             self._log(f"🎞️   帧数范围:  {config['min_frames']}–{config['max_frames']}")
-        self._log(f"🔎  特征描述子: {config['feature_type'].upper()}")
+        _ft_txt = {"orb": "ORB", "sift": "SIFT",
+                   "rootsift": "RootSIFT（实验）"}.get(config["feature_type"],
+                                                       config["feature_type"].upper())
+        self._log(f"🔎  特征描述子: {_ft_txt}")
         self._log(f"🔍  初始焦距猜测: {'开（1.0×长边）' if config['use_focal_guess'] else '关'}")
         self._log(f"🔁  回环检测:  {'开' if config['enable_loop'] else '关'}")
         self._log(f"🧭  位姿图优化: {'开' if config['enable_pgo'] else '关'}")
@@ -1935,7 +2150,17 @@ class MainWindow(QMainWindow):
         if _fcmb <= 0:
             self._log("🧠  帧缓存:     已禁用")
         else:
-            self._log(f"🧠  帧缓存:     {_fcmb} MiB（预加载到内存）")
+            self._log(f"🧠  帧缓存:     {_fcmb} MiB（稠密阶段预加载）")
+        # 界面的 _log 只进文本框，日志文件里看不到参数；这里同步写一份到 logging
+        logger.info(
+            "[配置] 模式=%s 输入=%s 特征=%s scale=%.2f 焦距猜测=%s "
+            "回环=%s PGO=%s 全局匹配=%s 缓存=%dMiB",
+            run_mode, config["image_dir"] or config["video"],
+            config["feature_type"], config["scale"],
+            config["use_focal_guess"], config["enable_loop"],
+            config["enable_pgo"], config["enable_global_matching"], _fcmb)
+        logger.info("[配置] 输出=%s 工作目录=%s",
+                    config["output_dir"], config["workdir"])
         if run_mode == "dense":
             self._log(
                 f"🧊  稠密参数:  降采样 ×{config['dense_downscale']}，"
@@ -2159,12 +2384,19 @@ class MainWindow(QMainWindow):
 
 # ---- 入口 ----
 def main():
+    # 内部评测口：界面上不显示参考模型输入框，启动时用参数注入
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--gt-model", default=None, help=argparse.SUPPRESS)
+    args, qt_args = parser.parse_known_args()
+
     setup_logging()
     set_affinity_to_all_cores()
-    app = QApplication(sys.argv)
+    app = QApplication([sys.argv[0]] + list(qt_args))
     app.setStyle("Fusion")
     app.setApplicationName("SfM Reconstruction")
     window = MainWindow()
+    if args.gt_model:
+        window.gt_model_path = os.path.abspath(args.gt_model)
     window.show()
     sys.exit(app.exec())
 

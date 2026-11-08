@@ -45,6 +45,7 @@ class DenseConfig:
     outlier_std: float = 2.0            # 统计滤波标准差倍数
     max_points: int = 2_000_000         # 点数上限，超出随机采样
     min_disparity: float = 1.0          # 视差有效下限（像素）
+    fusion_min_views: int = 1           # 体素融合所需最少帧对数（>1 去掉单对产生的点）
     enable_cache: bool = True           # 帧对级缓存
     cache_on_success: bool = False      # 正常完成也写缓存，默认只写中断
 
@@ -254,8 +255,11 @@ def dense_reconstruct(
         len(xyz), used, len(pairs), cached_hits, failed,
     )
 
-    # ---- 体素降采样 ----
-    xyz, rgb = _voxel_downsample(xyz, rgb, voxel_size)
+    # ---- 体素降采样 + 帧对融合 ----
+    _src = np.concatenate([np.full(len(a), i, dtype=np.int64)
+                           for i, a in enumerate(all_xyz)]) if all_xyz else None
+    xyz, rgb = _voxel_downsample(xyz, rgb, voxel_size,
+                                 min_views=cfg.fusion_min_views, src=_src)
     logger.info("[dense] 体素降采样后: %d 点", len(xyz))
 
     # ---- 统计离群点过滤 ----
@@ -714,8 +718,14 @@ def _voxel_downsample(
     xyz: np.ndarray,
     rgb: np.ndarray,
     voxel_size: float,
+    min_views: int = 1,
+    src: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """每个体素取 xyz / rgb 均值。"""
+    """每个体素取 xyz / rgb 均值。
+
+    min_views > 1 时再按「命中该体素的不同帧对数」过滤一遍：同一个体素被多个
+    帧对独立重建出来才算可信，能去掉单个帧对产生的重复点与边缘噪声。
+    """
     if len(xyz) == 0:
         return xyz, rgb
 
@@ -737,6 +747,23 @@ def _voxel_downsample(
                                     minlength=n) / counts
 
     out_rgb = np.clip(out_rgb, 0, 255).astype(np.uint8)
+
+    if min_views > 1 and src is not None and len(src) == len(inv):
+        s = np.asarray(src, dtype=np.int64)
+        span = int(s.max()) + 1
+        # 每个（体素, 帧对）组合只算一次
+        uniq_pair = np.unique(inv.astype(np.int64) * span + s)
+        vox_of_pair = uniq_pair // span
+        vox_ids, views = np.unique(vox_of_pair, return_counts=True)
+        keep = np.zeros(n, dtype=bool)
+        keep[vox_ids[views >= min_views]] = True
+        if not np.any(keep):
+            logger.warning("[dense] 没有体素满足 fusion_min_views=%d，跳过该过滤",
+                           min_views)
+        else:
+            out_xyz = out_xyz[keep]
+            out_rgb = out_rgb[keep]
+
     return out_xyz.astype(np.float32), out_rgb
 
 

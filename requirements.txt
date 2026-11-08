@@ -18,6 +18,16 @@
 #       pip install cython
 #       python build_accel.py        # 需要 gcc（维护者用的是 MinGW-w64）
 #   构建脚本默认不带 OpenMP，因此产物不依赖 libgomp-1.dll / libwinpthread-1.dll。
+#
+# 依赖用途
+#   numpy / scipy           矩阵运算、cKDTree 近邻查询、Rotation 旋转表示
+#   opencv-python-headless  抽帧、特征、匹配、光流、三角化、PnP、SGBM
+#   scikit-learn            回环词袋 MiniBatchKMeans（poses.py 顶层导入，必需）
+#   joblib                  特征提取多进程（loky 后端），按可用内存决定 worker 数
+#   pyceres                 光束法平差 / PGO / Sim3
+#   PySide6 / matplotlib    GUI（CLI 不导入，但装在同一个环境里即可）
+#   Pillow                  EXIF 焦距（matplotlib 已依赖，无需单独声明）
+#   psutil                  CPU 亲和性、内存探测
 
 numpy>=1.24.0
 scipy>=1.10.0

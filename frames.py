@@ -167,6 +167,33 @@ def list_images(image_dir: str, *, recursive: bool = True) -> List[str]:
     return files
 
 
+def exif_focal_ratio(image_path: str) -> Optional[float]:
+    """从 EXIF 的 35mm 等效焦距推「fx / 图像宽度」，读不到返回 None。
+
+    35mm 等效焦距按对角线定义，所以
+        fx / width = f35 / 43.27 * sqrt(1 + (h/w)^2)
+    与图像分辨率无关——缩放后的帧可以直接用同一个比值乘当前宽度。
+    """
+    try:
+        from PIL import Image
+        with Image.open(image_path) as im:
+            ex = im.getexif()
+            # FocalLengthIn35mmFilm 在 Exif 子 IFD 里，部分写入器会放到顶层
+            f35 = ex.get(41989)
+            if not f35:
+                f35 = ex.get_ifd(0x8769).get(41989)
+            w, h = im.size
+    except Exception:
+        return None
+    try:
+        f35 = float(f35)
+    except (TypeError, ValueError):
+        return None
+    if f35 <= 0 or w <= 0 or h <= 0:
+        return None
+    return f35 / 43.26661530556787 * (1.0 + (h / w) ** 2) ** 0.5
+
+
 def import_images(
     image_dir: str,
     output_dir: str,

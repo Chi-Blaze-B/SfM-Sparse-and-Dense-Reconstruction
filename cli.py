@@ -13,7 +13,7 @@ from typing import Optional, Tuple
 import numpy as np
 import psutil
 
-from frames import extract_frames, import_images
+from frames import extract_frames, import_images, list_images, exif_focal_ratio
 from poses import estimate_poses, CameraPose, FrameStatus
 from exporter import (
     intr_from_K,
@@ -121,6 +121,9 @@ def build_parser() -> argparse.ArgumentParser:
                              help="稠密重建最多处理帧对数")
     dense_group.add_argument("--dense-voxel-ratio", type=float, default=0.005,
                              help="稠密点云体素大小 / 场景尺度")
+    dense_group.add_argument("--dense-min-views", type=int, default=1,
+                             help="稠密融合：一个体素至少被多少个帧对命中才保留；"
+                                  "2 可去掉单帧对产生的重复点，但会稀疏一些")
 
     # 缓存复用
     parser.add_argument("--reuse-dir", type=str, default=None,
@@ -130,6 +133,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--frame-cache-mb", type=int, default=1500,
         help="帧图像内存缓存上限（MiB）；0 表示禁用。用于加速重复读取",
+    )
+
+    # 内部评测口：不对外暴露，不进 --help
+    parser.add_argument(
+        "--gt-model", type=str, default=None, help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--no-self-calibrate", action="store_true",
+        help="关闭无标定输入的径向畸变自标定。开启时若估计到显著 k1，会用去畸变"
+             "特征再跑一遍（耗时约翻倍）",
+    )
+    parser.add_argument(
+        "--self-calib-iter", action="store_const", const=True, default=None,
+        help="自标定后再估一次残余 k1，显著时跑第三遍（k1/中心更好，旋转可能变差，"
+             "耗时约 +20%%）",
+    )
+    parser.add_argument(
+        "--rot-edge-weight", type=float, default=None,
+        help="最终 BA 中两视图旋转约束的权重（默认 100）；0 关闭",
+    )
+    parser.add_argument(
+        "--pose-outlier-deg", type=float, default=None,
+        help="位姿校验阈值：与邻居的最小相对旋转偏差（默认 12°）；0 关闭",
     )
 
     return parser
@@ -312,17 +338,13 @@ def run_pipeline(args: argparse.Namespace) -> None:
     h, w = _img.shape[:2]
     logger.info("帧分辨率: %dx%d", w, h)
 
-    # ---- 帧缓存：预加载，避免位姿估计 / 稠密重建重复读盘 ----
-    if _configure_cache is not None:
-        if cache_mb > 0:
-            t_cache = time.time()
-            _configure_cache(max_bytes=cache_mb * 1024 * 1024,
-                             preload=frame_paths)
-            logger.info("帧图像已预加载到内存（上限 %d MiB，耗时 %.1fs）",
-                        cache_mb, time.time() - t_cache)
-        else:
-            _configure_cache(max_bytes=0)
-            logger.info("帧缓存已禁用（--frame-cache-mb 0）")
+    # ---- 帧缓存：这里只设上限，不预加载 ----
+    # 位姿估计阶段每帧只解码一次，预加载省不到任何工作量；反而会占住
+    # _auto_feature_workers 用来估算并行度的可用内存，白白少开一个 worker。
+    # 真正的预加载推迟到稠密重建之前（见步骤 3）。
+    if _configure_cache is not None and cache_mb <= 0:
+        _configure_cache(max_bytes=0)
+        logger.info("帧缓存已禁用（--frame-cache-mb 0）")
 
     # ---- 步骤 2：位姿估计 ----
     logger.info("[2/%d] 正在估计相机位姿...", n_steps)
@@ -336,6 +358,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     cached_keyframes = None
     cached_loop_closures = []
     cached_frame_status = None
+    cached_dist = None
 
     if intrinsics_file.exists() and poses_file.exists() and sparse_file.exists():
         K = np.load(intrinsics_file)
@@ -350,6 +373,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 cached_keyframes = _m.get("keyframes")
                 cached_loop_closures = [tuple(x) for x in _m.get("loop_closures", [])]
                 cached_frame_status = _m.get("frame_status")
+                cached_dist = _m.get("dist")
             except Exception as e:
                 logger.warning("读取 sfm_meta.json 失败: %s", e)
 
@@ -372,13 +396,29 @@ def run_pipeline(args: argparse.Namespace) -> None:
             logger.info("使用给定畸变系数: %d 个（%s）", n_d,
                         "COLMAP THIN_PRISM_FISHEYE" if n_d == 12 else "OpenCV")
 
+        # 焦距初值优先级：显式内参 > --use-focal-guess > EXIF > 内置启发（1.2×长边）
         focal_guess = None
-        if args.use_focal_guess and camera_matrix is None:
+        if camera_matrix is not None:
+            pass
+        elif args.use_focal_guess:
             focal_guess = float(max(w, h))
             fov_deg = 2.0 * np.degrees(np.arctan(max(w, h) / (2.0 * focal_guess)))
             axis = "水平" if w >= h else "垂直"
             logger.info("初始焦距猜测: %.1fpx（约 %.0f° %s FOV）",
                         focal_guess, fov_deg, axis)
+        elif image_mode:
+            _src = list_images(args.image_dir)
+            _ratio = exif_focal_ratio(_src[0]) if _src else None
+            if _ratio is not None:
+                focal_guess = _ratio * w
+                logger.info("按 EXIF 估计初始焦距: fx=%.1f px（%.2f×宽度）",
+                            focal_guess, _ratio)
+            else:
+                logger.info("图片无 EXIF 焦距，使用默认启发式 fx=%.1f px（1.2×长边）",
+                            max(w, h) * 1.2)
+        else:
+            logger.info("视频输入无 EXIF 焦距，使用默认启发式 fx=%.1f px（1.2×长边）",
+                        max(w, h) * 1.2)
 
         try:
             sfm_result = estimate_poses(
@@ -391,6 +431,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 enable_loop=not args.no_loop,
                 enable_pgo=not args.no_pgo,
                 enable_global_matching=args.enable_global_matching,
+                self_calibrate=not args.no_self_calibrate,
+                self_calib_iter=args.self_calib_iter,
+                rot_edge_weight=args.rot_edge_weight,
+                pose_outlier_deg=args.pose_outlier_deg,
             )
             K = sfm_result.intrinsics.K
             poses = sfm_result.poses
@@ -414,9 +458,26 @@ def run_pipeline(args: argparse.Namespace) -> None:
             n_lost = st.get(FrameStatus.LOST, 0) + st.get(FrameStatus.INVALID, 0)
             if n_lost > len(frame_paths) * 0.4:
                 logger.warning(
-                    "超过 40% 的帧丢失/无效（%d / %d），建议更换素材。",
+                    "超过 40%% 的帧丢失/无效（%d / %d），建议更换素材。",
                     n_lost, len(frame_paths),
                 )
+
+        if args.gt_model:
+            if not image_mode:
+                logger.warning("--gt-model 只对图片集输入有意义（视频帧名无法与参考模型对应）")
+            from eval_tools import evaluate_run, format_summary
+            logger.info("=== 参考模型评测 ===")
+            eval_metrics = evaluate_run(
+                sfm_result, frame_paths, args.gt_model,
+                img_scale=args.scale if image_mode else 1.0)
+            for _line in format_summary(eval_metrics).splitlines():
+                logger.info(_line)
+            try:
+                (output_dir / "evaluation.json").write_text(
+                    json.dumps(eval_metrics, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+            except Exception as e:
+                logger.warning("写入 evaluation.json 失败: %s", e)
 
         np.save(intrinsics_file, K)
         save_poses(poses, poses_file)
@@ -431,6 +492,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
                                   for a, b in sfm_result.loop_closures],
                 "frame_status": (list(sfm_result.frame_status)
                                  if sfm_result.frame_status else None),
+                # 自标定 / 用户给定的畸变模型必须落盘：复用目录时稠密阶段要靠它反畸变
+                "dist": (None if sfm_result.intrinsics.dist is None
+                         else [float(v) for v in
+                               np.asarray(sfm_result.intrinsics.dist).ravel()]),
             }, ensure_ascii=False))
         except Exception as e:
             logger.warning("写入 sfm_meta.json 失败: %s", e)
@@ -461,6 +526,13 @@ def run_pipeline(args: argparse.Namespace) -> None:
     if enable_dense:
         logger.info("[3/%d] 正在稠密重建...", n_steps)
         t0 = time.time()
+        # 稠密重建会跨帧对反复解码同一帧，这里才是缓存的用武之地。
+        if _configure_cache is not None and cache_mb > 0:
+            t_cache = time.time()
+            _configure_cache(max_bytes=cache_mb * 1024 * 1024,
+                             preload=frame_paths)
+            logger.info("帧图像已预加载到内存（上限 %d MiB，耗时 %.1fs）",
+                        cache_mb, time.time() - t_cache)
         try:
             from dense import dense_reconstruct, DenseConfig, DenseAbortedError
         except ImportError as e:
@@ -477,11 +549,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 _, _dist_dense = _load_calibration(args)
                 if _dist_dense is not None:
                     _intr.dist = np.asarray(_dist_dense, dtype=np.float64)
+                elif cached_dist:
+                    _intr.dist = np.asarray(cached_dist, dtype=np.float64)
 
             dense_cfg = DenseConfig(
                 downscale=args.dense_downscale,
                 max_pairs=args.dense_max_pairs,
                 voxel_ratio=args.dense_voxel_ratio,
+                fusion_min_views=args.dense_min_views,
             )
             dense_path = output_dir / "dense_points.ply"
 
